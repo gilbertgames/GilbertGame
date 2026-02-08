@@ -27,12 +27,16 @@ public:
 
 #endif
 
+public:
+
+	UPROPERTY(EditAnywhere, Category = "Instance")
+	bool bMirrored = false;
+
 protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Building", meta = (AllowPrivateAccess = "true"))
 	UStaticMeshComponent* MeshComponent;
 
-	UPROPERTY(EditAnywhere, Category = "Instance")
-	bool bMirror = false;
+
 
 	UPROPERTY(EditDefaultsOnly, Category = "Building")
 	EGridSlot GridSlot = EGridSlot::Floor;

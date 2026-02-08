@@ -22,7 +22,7 @@ void ABuildingActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChang
 		? PropertyChangedEvent.Property->GetFName()
 		: NAME_None;
 
-	if (PropName == GET_MEMBER_NAME_CHECKED(ABuildingActor, bMirror))
+	if (PropName == GET_MEMBER_NAME_CHECKED(ABuildingActor, bMirrored))
 	{
 		ApplyMirror();
 	}
@@ -227,7 +227,7 @@ void ABuildingActor::ApplyMirror()
 		return;
 
 	FVector Scale = FVector(1.f, 1.f, 1.f);
-	Scale.X = bMirror ? -1 : 1;
+	Scale.X = bMirrored ? -1 : 1;
 	MeshComponent->SetRelativeScale3D(Scale);
 }
 
