@@ -8,8 +8,9 @@ public class GilbertGameEditorTarget : TargetRules
 	public GilbertGameEditorTarget(TargetInfo Target) : base(Target)
 	{
 		Type = TargetType.Editor;
-		DefaultBuildSettings = BuildSettingsVersion.V6;
+		DefaultBuildSettings = BuildSettingsVersion.Latest;
+        IncludeOrderVersion = EngineIncludeOrderVersion.Latest;
 
-		ExtraModuleNames.AddRange( new string[] { "GilbertGame" } );
+        ExtraModuleNames.AddRange( new string[] { "GilbertGame" } );
 	}
 }
