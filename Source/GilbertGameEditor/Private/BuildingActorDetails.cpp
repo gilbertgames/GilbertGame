@@ -55,8 +55,13 @@ void FBuildingActorDetails::CustomizeDetails(IDetailLayoutBuilder& DetailBuilder
     // Example: move properties into the top category
     // (these names must match your UPROPERTY names)
     const TSharedPtr<IPropertyHandle> bMirrored  = DetailBuilder.GetProperty(GET_MEMBER_NAME_CHECKED(ABuildingActor, bMirrored));
-
     if (bMirrored && bMirrored->IsValidHandle())  TopCat.AddProperty(bMirrored);
+
+    const TSharedPtr<IPropertyHandle> bHalfHeight = DetailBuilder.GetProperty(GET_MEMBER_NAME_CHECKED(ABuildingActor, bHalfHeight));
+    if (bHalfHeight && bHalfHeight->IsValidHandle())  TopCat.AddProperty(bHalfHeight);
+
+    const TSharedPtr<IPropertyHandle> bCentered = DetailBuilder.GetProperty(GET_MEMBER_NAME_CHECKED(ABuildingActor, bCentered));
+    if (bCentered && bCentered->IsValidHandle())  TopCat.AddProperty(bCentered);
 
     // --- 3) Optionally hide the original properties from their original category ---
     // If they were in "Default" / another category, they might still show there.

@@ -1,5 +1,10 @@
 ﻿#include "Systems/Building/BuildingActor.h"
 
+#if WITH_EDITOR
+#include "Editor.h"
+#include "EditorViewportClient.h"
+#endif
+
 ABuildingActor::ABuildingActor()
 {
 	PrimaryActorTick.bCanEverTick = false;
@@ -26,6 +31,14 @@ void ABuildingActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChang
 	{
 		ApplyMirror();
 	}
+	else if (
+		PropName == GET_MEMBER_NAME_CHECKED(ABuildingActor, bHalfHeight) ||
+		PropName == GET_MEMBER_NAME_CHECKED(ABuildingActor, bCentered)
+		)
+	{
+		// Re-apply snap immediately when these change.
+		SnapToGridNow();
+	}
 }
 
 FIntVector ABuildingActor::WorldToCell(const FVector& World) const
@@ -45,6 +58,30 @@ FVector ABuildingActor::CellToWorld(const FIntVector& Cell) const
 		Cell.Z * GridZ
 	);
 }
+
+bool ABuildingActor::TryGetTranslateWidgetWorldLocation(FVector& OutWorld) const
+{
+	if (!GEditor)
+	{
+		return false;
+	}
+
+	FViewport* ActiveViewport = GEditor->GetActiveViewport();
+	if (!ActiveViewport)
+	{
+		return false;
+	}
+
+	FEditorViewportClient* ViewportClient = static_cast<FEditorViewportClient*>(ActiveViewport->GetClient());
+	if (!ViewportClient)
+	{
+		return false;
+	}
+
+	OutWorld = ViewportClient->GetWidgetLocation();
+	return true;
+}
+
 
 bool ABuildingActor::UsesDirection() const
 {
@@ -109,7 +146,6 @@ FRotator ABuildingActor::DirectionToRotation(EGridDirection Dir) const
 	{
 		return GetActorRotation();
 	}
-	//return FRotationMatrix::MakeFromXZ(-N, FVector::UpVector).Rotator();
 
 	FRotator Rot = FRotationMatrix::MakeFromXZ(N, FVector::UpVector).Rotator();
 
@@ -129,6 +165,18 @@ void ABuildingActor::ApplySnappedTransform(const FVector& Loc, const FRotator& R
 	bApplying = false;
 }
 
+FVector ABuildingActor::ApplyHalfHeightOffset(const FVector& InLoc) const
+{
+	if (!bHalfHeight)
+	{
+		return InLoc;
+	}
+
+	FVector Out = InLoc;
+	Out.Z += (GridZ * 0.5f);
+	return Out;
+}
+
 void ABuildingActor::EditorApplyTranslation(
 	const FVector& DeltaTranslation,
 	bool, bool, bool
@@ -140,11 +188,35 @@ void ABuildingActor::EditorApplyTranslation(
 	if (!bDragging)
 	{
 		bDragging = true;
+
+		// Prefer the editor widget's true world position (more consistent than accumulating deltas)
+		// but fall back to the actor location if we can't read the widget yet.
 		DragRawLocation = GetActorLocation();
+		DragWidgetLocation = FVector::ZeroVector;
+		bHasWidgetLocation = TryGetTranslateWidgetWorldLocation(DragWidgetLocation);
+		if (bHasWidgetLocation)
+		{
+			DragRawLocation = DragWidgetLocation;
+		}
+
 		DragCurrentCell = WorldToCell(DragRawLocation);
 	}
 
-	DragRawLocation += DeltaTranslation;
+	// On each tick, try to read the widget location again.
+	// If available, use that as the source-of-truth for snapping decisions.
+	FVector WidgetLoc = FVector::ZeroVector;
+	if (TryGetTranslateWidgetWorldLocation(WidgetLoc))
+	{
+		bHasWidgetLocation = true;
+		DragWidgetLocation = WidgetLoc;
+		DragRawLocation = WidgetLoc;
+	}
+	else
+	{
+		// Fallback: accumulate deltas (original behavior)
+		bHasWidgetLocation = false;
+		DragRawLocation += DeltaTranslation;
+	}
 
 	const FIntVector NewCell = WorldToCell(DragRawLocation);
 	if (NewCell != DragCurrentCell)
@@ -162,8 +234,17 @@ void ABuildingActor::EditorApplyTranslation(
 		const FVector Local = DragRawLocation - CellCenter;
 		GridDirection = ComputeDirectionFromLocal(Local);
 
-		const FVector Normal = DirectionToNormal(GridDirection);
-		FinalLoc = CellCenter + Normal * (GridXY * 0.5f);
+		// If centered: don't push to edge. Otherwise: normal wall edge offset.
+		if (!bCentered)
+		{
+			const FVector Normal = DirectionToNormal(GridDirection);
+			FinalLoc = CellCenter + Normal * (GridXY * 0.5f);
+		}
+		else
+		{
+			FinalLoc = CellCenter;
+		}
+
 		FinalRot = DirectionToRotation(GridDirection);
 	}
 	else
@@ -171,7 +252,25 @@ void ABuildingActor::EditorApplyTranslation(
 		GridDirection = EGridDirection::None;
 	}
 
+	FinalLoc = ApplyHalfHeightOffset(FinalLoc);
 	ApplySnappedTransform(FinalLoc, FinalRot);
+}
+
+void ABuildingActor::PostEditMove(bool bFinished)
+{
+	Super::PostEditMove(bFinished);
+
+	if (bFinished)
+	{
+		// Reset our drag state so the next drag starts clean.
+		bDragging = false;
+		bHasWidgetLocation = false;
+		DragWidgetLocation = FVector::ZeroVector;
+
+		// Ensure we finish snapped (covers any edge cases where the last EditorApplyTranslation
+		// call didn't run with the final widget position).
+		SnapToGridNow();
+	}
 }
 
 void ABuildingActor::PostActorCreated()
@@ -211,13 +310,23 @@ void ABuildingActor::SnapToGridNow()
 			GridDirection = ComputeDirectionFromLocal(Local);
 		}
 
-		const FVector Normal = DirectionToNormal(GridDirection);
-		ApplySnappedTransform(CellCenter + Normal * (GridXY * 0.5f), DirectionToRotation(GridDirection));
+		FVector Loc = CellCenter;
+
+		if (!bCentered)
+		{
+			const FVector Normal = DirectionToNormal(GridDirection);
+			Loc = CellCenter + Normal * (GridXY * 0.5f);
+		}
+
+		Loc = ApplyHalfHeightOffset(Loc);
+		ApplySnappedTransform(Loc, DirectionToRotation(GridDirection));
 	}
 	else
 	{
 		GridDirection = EGridDirection::None;
-		ApplySnappedTransform(CellCenter, GetActorRotation());
+
+		const FVector Loc = ApplyHalfHeightOffset(CellCenter);
+		ApplySnappedTransform(Loc, GetActorRotation());
 	}
 }
 

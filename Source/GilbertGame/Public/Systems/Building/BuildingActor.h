@@ -22,21 +22,27 @@ public:
 		bool bCtrlDown
 	) override;
 
+	virtual void PostEditMove(bool bFinished) override;
+
 	virtual void PostActorCreated() override;
 	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
-
 #endif
 
 public:
-
 	UPROPERTY(EditAnywhere, Category = "Instance")
 	bool bMirrored = false;
+
+	// When true: snap normally, then add GridZ * 0.5 to final Z.
+	UPROPERTY(EditAnywhere, Category = "Instance")
+	bool bHalfHeight = false;
+
+	// Walls only: when true, do NOT apply the +/- GridXY * 0.5 edge offset (place at cell center).
+	UPROPERTY(EditAnywhere, Category = "Instance", meta = (EditCondition = "GridSlot == EGridSlot::Wall", EditConditionHides))
+	bool bCentered = false;
 
 protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Building", meta = (AllowPrivateAccess = "true"))
 	UStaticMeshComponent* MeshComponent;
-
-
 
 	UPROPERTY(EditDefaultsOnly, Category = "Building")
 	EGridSlot GridSlot = EGridSlot::Floor;
@@ -58,6 +64,9 @@ private:
 	FVector DragRawLocation = FVector::ZeroVector;
 	FIntVector DragCurrentCell = FIntVector::ZeroValue;
 
+	FVector DragWidgetLocation = FVector::ZeroVector;
+	bool bHasWidgetLocation = false;
+
 	bool bDragging = false;
 	bool bApplying = false;
 
@@ -65,7 +74,7 @@ private:
 	FIntVector WorldToCell(const FVector& World) const;
 	FVector CellToWorld(const FIntVector& Cell) const;
 
-	// Direction helpers (Option B)
+	// Direction helpers
 	bool UsesDirection() const;
 	EGridDirection ComputeDirectionFromLocal(const FVector& Local) const;
 
@@ -73,6 +82,12 @@ private:
 	FRotator DirectionToRotation(EGridDirection Dir) const;
 
 	void ApplySnappedTransform(const FVector& Loc, const FRotator& Rot);
+
+	// If possible, read the editor translate widget's true world position.
+	bool TryGetTranslateWidgetWorldLocation(FVector& OutWorld) const;
+
+	// Consistent half-height offset application
+	FVector ApplyHalfHeightOffset(const FVector& InLoc) const;
 
 	void SnapToGridNow();
 	void ApplyMirror();
