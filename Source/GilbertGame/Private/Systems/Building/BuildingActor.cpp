@@ -5,6 +5,8 @@
 #include "EditorViewportClient.h"
 #endif
 
+
+
 ABuildingActor::ABuildingActor()
 {
 	PrimaryActorTick.bCanEverTick = false;
@@ -120,6 +122,48 @@ FVector ABuildingActor::CellToWorld(const FIntVector& Cell) const
 		Cell.Z * GridZ
 	);
 }
+
+void ABuildingActor::SyncGridCellFromActorWorld(bool bPrevHalfHeight, bool bPrevCentered)
+{
+	FVector RefLoc = GetActorLocation();
+	RefLoc = RemoveHalfHeightOffset(RefLoc, bPrevHalfHeight);
+
+	if (UsesDirection() && GridDirection == EGridDirection::None)
+	{
+		GridDirection = ComputeDirectionFromRotation();
+	}
+
+	RefLoc = RemoveWallEdgeOffset(RefLoc, GridDirection, bPrevCentered);
+	GridCell = WorldToCell(RefLoc);
+}
+
+void ABuildingActor::ApplyFromGridCell()
+{
+	// Note: GridCell is the canonical location (offsets removed).
+	const FVector CellCenter = CellToWorld(GridCell);
+
+	FVector FinalLoc = CellCenter;
+	FRotator FinalRot = GetActorRotation();
+
+	if (UsesDirection())
+	{
+		if (GridDirection == EGridDirection::None)
+		{
+			GridDirection = ComputeDirectionFromRotation();
+		}
+
+		FinalLoc = ApplyWallEdgeOffset(CellCenter, GridDirection, bCentered);
+		FinalRot = DirectionToRotation(GridDirection);
+	}
+	else
+	{
+		GridDirection = EGridDirection::None;
+	}
+
+	FinalLoc = ApplyHalfHeightOffset(FinalLoc, bHalfHeight);
+	ApplySnappedTransform(FinalLoc, FinalRot);
+}
+
 
 // ------------------------------
 // Direction helpers
@@ -253,12 +297,24 @@ EGridDirection ABuildingActor::ComputeWallDirectionFromLocal(EGridDirection Curr
 		// If we somehow don't have a valid current axis, fall through to dominance.
 	}
 
+	// Extra centered-mode stability: near the diagonal (AbsFx ~= AbsFy), keep the current axis.
+	// This prevents rapid X/Y swaps when hovering around the diagonal divider inside a cell.
+	if (bCentered && DiagonalAxisDeadzoneFrac > 0.f)
+	{
+		const float DiagT = FMath::Clamp(DiagonalAxisDeadzoneFrac, 0.0f, 0.49f);
+		if (FMath::Abs(AbsFx - AbsFy) < DiagT)
+		{
+			if (bCurrentIsX) return SolveSignX();
+			if (bCurrentIsY) return SolveSignY();
+		}
+	}
+
 	// 2) Free/XY mode: choose axis by dominance, with stronger stickiness toward current axis.
 	bool bChooseX = (AbsFx >= AbsFy);
 
 	// NEW: extra “stay on current axis” factor.
 	// > 1.0 means you need the other axis to be that much stronger before switching.
-	const float PreferCurrentAxis = 1.20f; // try 1.10 - 1.35
+	const float PreferCurrentAxis = bCentered ? 1.60f : 1.20f; // centered needs more stickiness near diagonals
 
 	if (bCurrentIsX)
 	{
@@ -435,6 +491,7 @@ void ABuildingActor::EditorApplyTranslation(const FVector& DeltaTranslation, boo
 
 		DragRefLocation = RefWorld;
 		DragCurrentCell = WorldToCell(DragRefLocation);
+		GridCell = DragCurrentCell;
 
 		PrevDragCellForDirLock = DragCurrentCell;
 		bLockDirectionUntilInsideCell = false;
@@ -556,6 +613,7 @@ void ABuildingActor::EditorApplyTranslation(const FVector& DeltaTranslation, boo
 
 	DragRefLocation = RefWorld;
 	DragCurrentCell = WorldToCell_StableDuringDrag(DragRefLocation, DragCurrentCell);
+	GridCell = DragCurrentCell;
 
 	if (bCentered)
 	{
@@ -713,33 +771,8 @@ void ABuildingActor::SnapToGridNowWithPrev(bool bPrevHalfHeight, bool bPrevCente
 		return;
 	}
 
-	if (UsesDirection() && GridDirection == EGridDirection::None)
-	{
-		GridDirection = ComputeDirectionFromRotation();
-	}
-
-	FVector RefLoc = GetActorLocation();
-	RefLoc = RemoveHalfHeightOffset(RefLoc, bPrevHalfHeight);
-	RefLoc = RemoveWallEdgeOffset(RefLoc, GridDirection, bPrevCentered);
-
-	const FIntVector Cell = WorldToCell(RefLoc);
-	const FVector CellCenter = CellToWorld(Cell);
-
-	FVector FinalLoc = CellCenter;
-	FRotator FinalRot = GetActorRotation();
-
-	if (UsesDirection())
-	{
-		FinalLoc = ApplyWallEdgeOffset(CellCenter, GridDirection, bCentered);
-		FinalRot = DirectionToRotation(GridDirection);
-	}
-	else
-	{
-		GridDirection = EGridDirection::None;
-	}
-
-	FinalLoc = ApplyHalfHeightOffset(FinalLoc, bHalfHeight);
-	ApplySnappedTransform(FinalLoc, FinalRot);
+	SyncGridCellFromActorWorld(bPrevHalfHeight, bPrevCentered);
+	ApplyFromGridCell();
 }
 
 static int32 StableCell1D(float WorldCoord, float Grid, int32 PrevCell, float HystFrac)

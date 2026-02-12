@@ -6,6 +6,8 @@
 #include "Systems/Building/EGridDirection.h"
 #include "BuildingActor.generated.h"
 
+
+
 UCLASS()
 class GILBERTGAME_API ABuildingActor : public AActor
 {
@@ -36,6 +38,11 @@ public:
 
 	UPROPERTY(EditAnywhere, Category = "Instance", meta = (EditCondition = "GridSlot == EGridSlot::Wall", EditConditionHides))
 	bool bCentered = false;
+
+	// Canonical snapped cell location. The actor's world transform is derived from this + other flags.
+	// This is the source of truth during dragging (prevents float drift / boundary jitter).
+	UPROPERTY(VisibleInstanceOnly, Category = "Instance|Grid", meta = (DisplayName = "Grid Cell"))
+	FIntVector GridCell = FIntVector::ZeroValue;
 
 protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Building", meta = (AllowPrivateAccess = "true"))
@@ -70,6 +77,11 @@ protected:
 	// Fraction of GridXY radius around center.
 	UPROPERTY(EditDefaultsOnly, Category = "Building|Grid", meta = (ClampMin = "0.0", ClampMax = "0.49"))
 	float CenterAxisFreezeFrac = 0.2f;
+
+	// When centered and near the diagonal (|AbsFx-AbsFy| small), keep the current axis to prevent rapid X/Y swaps.
+	// Expressed in normalized tile units (Local/GridXY).
+	UPROPERTY(EditDefaultsOnly, Category = "Building|Grid", meta = (ClampMin = "0.0", ClampMax = "0.49"))
+	float DiagonalAxisDeadzoneFrac = 0.1f;
 
 	// Session-latched XY intent detection:
 	// amount of accumulated motion required in BOTH X and Y before we declare this drag session "XY".
@@ -121,8 +133,15 @@ private:
 	};
 
 	// Grid helpers
+	// Compute the canonical cell from a reference world location (offsets removed).
 	FIntVector WorldToCell(const FVector& World) const;
 	FVector CellToWorld(const FIntVector& Cell) const;
+
+	// Rebuild GridCell from the actor's current world transform, removing the *previously applied* offsets.
+	void SyncGridCellFromActorWorld(bool bPrevHalfHeight, bool bPrevCentered);
+
+	// Apply actor transform from GridCell + current flags.
+	void ApplyFromGridCell();
 
 	FIntVector WorldToCell_StableDuringDrag(const FVector& World, const FIntVector& PrevCell) const;
 
