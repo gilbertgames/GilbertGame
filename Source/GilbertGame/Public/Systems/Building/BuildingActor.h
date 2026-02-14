@@ -6,8 +6,6 @@
 #include "Systems/Building/EGridDirection.h"
 #include "BuildingActor.generated.h"
 
-
-
 UCLASS()
 class GILBERTGAME_API ABuildingActor : public AActor
 {
@@ -78,11 +76,6 @@ protected:
 	UPROPERTY(EditDefaultsOnly, Category = "Building|Grid", meta = (ClampMin = "0.0", ClampMax = "0.49"))
 	float CenterAxisFreezeFrac = 0.2f;
 
-	// When centered and near the diagonal (|AbsFx-AbsFy| small), keep the current axis to prevent rapid X/Y swaps.
-	// Expressed in normalized tile units (Local/GridXY).
-	UPROPERTY(EditDefaultsOnly, Category = "Building|Grid", meta = (ClampMin = "0.0", ClampMax = "0.49"))
-	float DiagonalAxisDeadzoneFrac = 0.1f;
-
 	// Session-latched XY intent detection:
 	// amount of accumulated motion required in BOTH X and Y before we declare this drag session "XY".
 	UPROPERTY(EditDefaultsOnly, Category = "Building|Grid", meta = (ClampMin = "0.0"))
@@ -107,7 +100,7 @@ private:
 
 	// Cached "previous applied" offset state (used to undo offsets correctly when toggling)
 	bool bPrevAppliedHalfHeight = false;
-	bool bPrevAppliedCentered = false;
+	bool bPrevAppliedCentered = false; // Stores "centered-wall style" (Roof OR Wall+bCentered), not just raw bCentered.
 
 	// For "no snap on click"
 	FVector PrevDragRawWorld = FVector::ZeroVector;
@@ -147,6 +140,11 @@ private:
 
 	// Direction helpers
 	bool UsesDirection() const;
+	bool UsesWallEdgeOffset() const;
+	bool UsesCenteredWallStyle() const;
+
+	// Effective slot: centered walls behave exactly like Roof.
+	EGridSlot GetEffectiveSlot() const;
 	EGridDirection ComputeDirectionFromRotation() const;
 	FVector DirectionToNormal(EGridDirection Dir) const;
 	FRotator DirectionToRotation(EGridDirection Dir) const;

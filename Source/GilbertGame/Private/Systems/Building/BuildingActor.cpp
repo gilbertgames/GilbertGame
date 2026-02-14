@@ -5,8 +5,6 @@
 #include "EditorViewportClient.h"
 #endif
 
-
-
 ABuildingActor::ABuildingActor()
 {
 	PrimaryActorTick.bCanEverTick = false;
@@ -152,7 +150,7 @@ void ABuildingActor::ApplyFromGridCell()
 			GridDirection = ComputeDirectionFromRotation();
 		}
 
-		FinalLoc = ApplyWallEdgeOffset(CellCenter, GridDirection, bCentered);
+		FinalLoc = ApplyWallEdgeOffset(CellCenter, GridDirection, UsesCenteredWallStyle());
 		FinalRot = DirectionToRotation(GridDirection);
 	}
 	else
@@ -168,14 +166,44 @@ void ABuildingActor::ApplyFromGridCell()
 // ------------------------------
 // Direction helpers
 // ------------------------------
+
+EGridSlot ABuildingActor::GetEffectiveSlot() const
+{
+	return (GridSlot == EGridSlot::Wall && bCentered) ? EGridSlot::Roof : GridSlot;
+}
+
 bool ABuildingActor::UsesDirection() const
 {
-	return GridSlot == EGridSlot::Wall;
+	// "Directional pieces" are anything that uses GridDirection-driven rotation.
+	// IMPORTANT: Treat (Wall + bCentered) as Roof for *all* behavior (including axis lock, solve, and offsets).
+	const EGridSlot EffectiveSlot = GetEffectiveSlot();
+	return (EffectiveSlot == EGridSlot::Wall) || (EffectiveSlot == EGridSlot::Roof);
+}
+
+bool ABuildingActor::UsesWallEdgeOffset() const
+{
+	// Only true edge-walls (non-centered) use the half-cell translation.
+	return GetEffectiveSlot() == EGridSlot::Wall;
+}
+
+bool ABuildingActor::UsesCenteredWallStyle() const
+{
+	// Roof-style: directional rotation only (no positional edge offset).
+	// This includes actual Roof pieces AND centered Walls (treated as Roof).
+	return GetEffectiveSlot() == EGridSlot::Roof;
 }
 
 EGridDirection ABuildingActor::ComputeDirectionFromRotation() const
 {
-	const FVector Fwd = GetActorForwardVector();
+	FVector Fwd = GetActorForwardVector();
+
+	// Direction inference must mirror DirectionToRotation's 180° facing offset.
+	// For Roof and centered walls, we apply +180° when outputting rotation, so we un-bake it here.
+	if (UsesCenteredWallStyle())
+	{
+		Fwd *= -1.f;
+	}
+
 	const float AbsX = FMath::Abs(Fwd.X);
 	const float AbsY = FMath::Abs(Fwd.Y);
 
@@ -211,6 +239,12 @@ FRotator ABuildingActor::DirectionToRotation(EGridDirection Dir) const
 	// Mesh forward-axis correction
 	Rot.Yaw += 90.f;
 
+	// Roof + centered walls share a consistent 180° facing offset.
+	if (UsesCenteredWallStyle())
+	{
+		Rot.Yaw += 180.f;
+	}
+
 	return Rot;
 }
 
@@ -241,7 +275,7 @@ EGridDirection ABuildingActor::ComputeWallDirectionFromLocal(EGridDirection Curr
 
 	auto SolveSignX = [&]() -> EGridDirection
 		{
-			const bool bWantsPos = bCentered ? (Fx <= 0.f) : (Fx >= 0.f);
+			const bool bWantsPos = (Fx >= 0.f);
 
 			if (bCurrentIsX)
 			{
@@ -257,7 +291,7 @@ EGridDirection ABuildingActor::ComputeWallDirectionFromLocal(EGridDirection Curr
 
 	auto SolveSignY = [&]() -> EGridDirection
 		{
-			const bool bWantsPos = bCentered ? (Fy <= 0.f) : (Fy >= 0.f);
+			const bool bWantsPos = (Fy >= 0.f);
 
 			if (bCurrentIsY)
 			{
@@ -282,39 +316,12 @@ EGridDirection ABuildingActor::ComputeWallDirectionFromLocal(EGridDirection Curr
 	}
 
 	// 2) Free/XY mode: choose axis by dominance, with stickiness.
-	// Extra centered-mode stability: near the cell center, freeze the axis to avoid flicker.
-	const float FreezeT = FMath::Clamp(CenterAxisFreezeFrac, 0.0f, 0.49f);
-
-	// "Near center" means both axes are close to 0 in normalized tile space.
-	const bool bNearCenter = (AbsFx < FreezeT) && (AbsFy < FreezeT);
-
-	if (bCentered && bNearCenter)
-	{
-		// Freeze axis choice near centerline (keep current axis).
-		if (bCurrentIsX) return SolveSignX();
-		if (bCurrentIsY) return SolveSignY();
-
-		// If we somehow don't have a valid current axis, fall through to dominance.
-	}
-
-	// Extra centered-mode stability: near the diagonal (AbsFx ~= AbsFy), keep the current axis.
-	// This prevents rapid X/Y swaps when hovering around the diagonal divider inside a cell.
-	if (bCentered && DiagonalAxisDeadzoneFrac > 0.f)
-	{
-		const float DiagT = FMath::Clamp(DiagonalAxisDeadzoneFrac, 0.0f, 0.49f);
-		if (FMath::Abs(AbsFx - AbsFy) < DiagT)
-		{
-			if (bCurrentIsX) return SolveSignX();
-			if (bCurrentIsY) return SolveSignY();
-		}
-	}
-
 	// 2) Free/XY mode: choose axis by dominance, with stronger stickiness toward current axis.
 	bool bChooseX = (AbsFx >= AbsFy);
 
 	// NEW: extra “stay on current axis” factor.
 	// > 1.0 means you need the other axis to be that much stronger before switching.
-	const float PreferCurrentAxis = bCentered ? 1.60f : 1.20f; // centered needs more stickiness near diagonals
+	const float PreferCurrentAxis = 1.20f; // try 1.10 - 1.35
 
 	if (bCurrentIsX)
 	{
@@ -380,7 +387,7 @@ FVector ABuildingActor::RemoveHalfHeightOffset(const FVector& InLoc, bool bUseHa
 
 FVector ABuildingActor::ApplyWallEdgeOffset(const FVector& InLoc, EGridDirection Dir, bool bUseCentered) const
 {
-	if (!UsesDirection() || bUseCentered)
+	if (!UsesWallEdgeOffset() || bUseCentered)
 	{
 		return InLoc;
 	}
@@ -396,7 +403,7 @@ FVector ABuildingActor::ApplyWallEdgeOffset(const FVector& InLoc, EGridDirection
 
 FVector ABuildingActor::RemoveWallEdgeOffset(const FVector& InLoc, EGridDirection Dir, bool bUseCentered) const
 {
-	if (!UsesDirection() || bUseCentered)
+	if (!UsesWallEdgeOffset() || bUseCentered)
 	{
 		return InLoc;
 	}
@@ -431,7 +438,7 @@ void ABuildingActor::ApplySnappedTransform(const FVector& Loc, const FRotator& R
 void ABuildingActor::UpdatePrevAppliedFlags()
 {
 	bPrevAppliedHalfHeight = bHalfHeight;
-	bPrevAppliedCentered = bCentered;
+	bPrevAppliedCentered = UsesCenteredWallStyle();
 }
 
 void ABuildingActor::ResetDragSessionState()
@@ -585,37 +592,80 @@ void ABuildingActor::EditorApplyTranslation(const FVector& DeltaTranslation, boo
 
 
 	// ============================================================
-	// PASS 1 — Direction intent in a temp cell (no edge feedback)
 	// ============================================================
-	FVector TempRef = RawWorld;
-	TempRef = RemoveHalfHeightOffset(TempRef, bHalfHeight);
+	// PASS 1+2 — Resolve a stable seed cell, compute direction intent, then resolve the final cell.
+	//
+	// Roof-style (Roof + centered-walls-as-roof): direction drives cell selection (flip-before-move).
+	// Edge-walls (Wall && !bCentered): ONLY 180° flips drive cell selection; axis changes keep their older feel.
+	// ============================================================
+	const bool bRoofStyle = UsesCenteredWallStyle();
+	const bool bEdgeWall  = UsesWallEdgeOffset() && !bRoofStyle;
 
-	const FIntVector TempCell = WorldToCell(TempRef);
-	const FVector TempCenter = CellToWorld(TempCell);
+	// Base reference: strip vertical offsets only.
+	FVector BaseRef = RawWorld;
+	BaseRef = RemoveHalfHeightOffset(BaseRef, bHalfHeight);
 
-	EGridDirection DirectionIntent = GridDirection;
+	// Seed direction (used to pick an initial cell to evaluate intent within).
+	EGridDirection SeedDir = GridDirection;
+	if (!bHasMeaningfulMove)
+	{
+		SeedDir = DragStartDirection;
+	}
+
+	// 1) Seed cell: remove the offset using the seed direction.
+	FVector SeedRefWorld = BaseRef;
+	if (UsesDirection())
+	{
+		SeedRefWorld = RemoveWallEdgeOffset(SeedRefWorld, SeedDir, bRoofStyle);
+	}
+
+	const FIntVector SeedCell = WorldToCell_StableDuringDrag(SeedRefWorld, DragCurrentCell);
+	const FVector SeedCenter = CellToWorld(SeedCell);
+
+	// 2) Direction intent: evaluate within the seed cell center (stable).
+	EGridDirection DirectionIntent = SeedDir;
 	if (!bHasMeaningfulMove)
 	{
 		DirectionIntent = DragStartDirection;
 	}
 	else if (UsesDirection())
 	{
-		const FVector LocalForDir_Intent = MakeLocalForDirection(RawWorld, TempCenter);
-		DirectionIntent = ComputeWallDirectionFromLocal(DirectionIntent, LocalForDir_Intent, AxisLock);
+		const FVector LocalForDir_Intent = MakeLocalForDirection(RawWorld, SeedCenter);
+		DirectionIntent = ComputeWallDirectionFromLocal(SeedDir, LocalForDir_Intent, AxisLock);
 	}
 
-	// ============================================================
-	// PASS 2 — Remove edge using intent, then solve TRUE cell
-	// ============================================================
-	FVector RefWorld = RawWorld;
-	RefWorld = RemoveHalfHeightOffset(RefWorld, bHalfHeight);
-	RefWorld = RemoveWallEdgeOffset(RefWorld, DirectionIntent, bCentered);
+	auto IsOppositeSameAxis = [](EGridDirection A, EGridDirection B) -> bool
+	{
+		const bool bAX = (A == EGridDirection::PosX || A == EGridDirection::NegX);
+		const bool bBX = (B == EGridDirection::PosX || B == EGridDirection::NegX);
+		const bool bAY = (A == EGridDirection::PosY || A == EGridDirection::NegY);
+		const bool bBY = (B == EGridDirection::PosY || B == EGridDirection::NegY);
+		if (bAX && bBX) return (A != B); // PosX <-> NegX
+		if (bAY && bBY) return (A != B); // PosY <-> NegY
+		return false;
+	};
 
-	DragRefLocation = RefWorld;
-	DragCurrentCell = WorldToCell_StableDuringDrag(DragRefLocation, DragCurrentCell);
+	// 3) Final cell:
+	// - Roof-style pieces: recompute cell using DirectionIntent (flip-before-move feel).
+	// - Edge-walls: ONLY recompute the cell on 180° flips; axis changes keep the old snappy rotation feel.
+	DragCurrentCell = SeedCell;
+	DragRefLocation = SeedRefWorld;
+
+	const bool bIs180Flip = IsOppositeSameAxis(SeedDir, DirectionIntent);
+	const bool bShouldRecomputeCell = UsesDirection() && (!bEdgeWall || bIs180Flip);
+
+	if (bShouldRecomputeCell)
+	{
+		FVector RefWorld = BaseRef;
+		RefWorld = RemoveWallEdgeOffset(RefWorld, DirectionIntent, bRoofStyle);
+
+		DragRefLocation = RefWorld;
+		DragCurrentCell = WorldToCell_StableDuringDrag(DragRefLocation, SeedCell);
+	}
+
 	GridCell = DragCurrentCell;
 
-	if (bCentered)
+	if (bEdgeWall)
 	{
 		if (DragCurrentCell != PrevDragCellForDirLock)
 		{
@@ -627,7 +677,6 @@ void ABuildingActor::EditorApplyTranslation(const FVector& DeltaTranslation, boo
 
 	const FVector CellCenter = CellToWorld(DragCurrentCell);
 
-	// ============================================================
 	// PASS 3 — Final direction solve in final cell
 	// ============================================================
 	FVector FinalLoc = CellCenter;
@@ -635,7 +684,7 @@ void ABuildingActor::EditorApplyTranslation(const FVector& DeltaTranslation, boo
 
 	bool bAllowDirectionSolve = true;
 
-	if (bCentered && bLockDirectionUntilInsideCell)
+	if (UsesWallEdgeOffset() && !UsesCenteredWallStyle() && bLockDirectionUntilInsideCell)
 	{
 		const FVector Local = MakeLocalForDirection(RawWorld, CellCenter);
 
@@ -677,7 +726,7 @@ void ABuildingActor::EditorApplyTranslation(const FVector& DeltaTranslation, boo
 		}
 
 		GridDirection = NewDir;
-		FinalLoc = ApplyWallEdgeOffset(CellCenter, GridDirection, bCentered);
+		FinalLoc = ApplyWallEdgeOffset(CellCenter, GridDirection, UsesCenteredWallStyle());
 		FinalRot = DirectionToRotation(GridDirection);
 	}
 	else
