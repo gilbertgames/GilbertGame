@@ -11,12 +11,12 @@
 			"AdditionalDependencies": [
 				"Engine"
 			]
-		}, 
+		},
 		{
-    		"Name": "GilbertGameEditor",
-    		"Type": "Editor",
-    		"LoadingPhase": "Default"
-  		}
+			"Name": "GilbertGameEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
 	],
 	"Plugins": [
 		{
