@@ -1,0 +1,21 @@
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+
+Texture2D InputTexture;
+SamplerState InputSampler;
+
+void MainVS(
+    in float4 InPosition : ATTRIBUTE0,
+    out float4 OutPosition : SV_POSITION,
+    out float2 OutUV : TEXCOORD0)
+{
+    OutPosition = InPosition;
+    OutUV = InPosition.xy * float2(0.5f, -0.5f) + 0.5f;
+}
+
+float4 MainPS(
+    float4 Position : SV_POSITION,
+    float2 UV : TEXCOORD0) : SV_Target0
+{
+    return float4(1.0, 0.0, 1.0, 1.0);
+}
