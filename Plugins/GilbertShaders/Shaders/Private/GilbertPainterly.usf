@@ -1,10 +1,35 @@
 #include "/Engine/Public/Platform.ush"
 
+#define DEBUG_MODE 1 // 0 = luminance, 1 = gradient
+
 Texture2D InputTexture;
 SamplerState InputSampler;
 
-float4 MainPS(float2 UV : TexCoord) : SV_Target0
+float2 InvViewportSize;
+
+float SampleLuma(float2 UV)
 {
     float3 Color = InputTexture.Sample(InputSampler, UV).rgb;
-    return float4(1.0 - Color, 1.0);
+    return dot(Color, float3(0.299, 0.587, 0.114));
+}
+
+float4 MainPS(float2 UV : TexCoord) : SV_Target0
+{
+#if DEBUG_MODE == 0
+    float Luma = SampleLuma(UV);
+    return float4(Luma, Luma, Luma, 1.0);
+#else
+    float2 Texel = InvViewportSize;
+
+    float Left = SampleLuma(UV - float2(Texel.x, 0.0));
+    float Right = SampleLuma(UV + float2(Texel.x, 0.0));
+    float Up = SampleLuma(UV - float2(0.0, Texel.y));
+    float Down = SampleLuma(UV + float2(0.0, Texel.y));
+
+    float Dx = Right - Left;
+    float Dy = Down - Up;
+    float Gradient = saturate(sqrt(Dx * Dx + Dy * Dy) * 4.0);
+
+    return float4(Gradient.xxx, 1.0);
+#endif
 }

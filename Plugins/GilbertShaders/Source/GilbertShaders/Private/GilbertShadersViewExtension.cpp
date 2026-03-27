@@ -68,9 +68,18 @@ FScreenPassTexture FGilbertShadersViewExtension::AddGilbertPainterlyPass(
     FGilbertPainterlyPS::FParameters* PassParameters =
         GraphBuilder.AllocParameters<FGilbertPainterlyPS::FParameters>();
 
+
+
+    const FIntRect ViewRect = View.UnconstrainedViewRect;
+    const float ViewportWidth = float(ViewRect.Width());
+    const float ViewportHeight = float(ViewRect.Height());
+
     PassParameters->InputTexture = InputSceneColor.Texture;
     PassParameters->InputSampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
     PassParameters->RenderTargets[0] = Output.GetRenderTargetBinding();
+    PassParameters->InvViewportSize = FVector2f(1.0f / ViewportWidth, 1.0f / ViewportHeight);
+
+
 
     const FScreenPassTextureViewport InputViewport(InputSceneColor);
     const FScreenPassTextureViewport OutputViewport(Output);
