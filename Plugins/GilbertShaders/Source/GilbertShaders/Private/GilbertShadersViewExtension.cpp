@@ -1,6 +1,6 @@
 #include "GilbertShadersViewExtension.h"
 
-#include "GilbertFullscreenShader.h"
+#include "GilbertPainterlyShader.h"
 
 #include "Logging/LogMacros.h"
 #include "PixelShaderUtils.h"
@@ -50,16 +50,16 @@ FScreenPassTexture FGilbertShadersViewExtension::AfterTonemap_RenderThread(
         return SceneColor;
     }
 
-    UE_LOG(LogGilbertShadersViewExt, Warning, TEXT("GilbertShaders: SceneColor valid, adding fullscreen pass"));
-    return AddGilbertFullscreenPass(GraphBuilder, View, SceneColor);
+    UE_LOG(LogGilbertShadersViewExt, Warning, TEXT("GilbertShaders: SceneColor valid, adding painterly pass"));
+    return AddGilbertPainterlyPass(GraphBuilder, View, SceneColor);
 }
 
-FScreenPassTexture FGilbertShadersViewExtension::AddGilbertFullscreenPass(
+FScreenPassTexture FGilbertShadersViewExtension::AddGilbertPainterlyPass(
     FRDGBuilder& GraphBuilder,
     const FSceneView& View,
     const FScreenPassTexture& InputSceneColor)
 {
-    UE_LOG(LogGilbertShadersViewExt, Warning, TEXT("GilbertShaders: AddGilbertFullscreenPass"));
+    UE_LOG(LogGilbertShadersViewExt, Warning, TEXT("GilbertShaders: AddGilbertPainterlyPass"));
 
     FScreenPassRenderTarget Output = FScreenPassRenderTarget::CreateFromInput(
         GraphBuilder,
@@ -67,8 +67,8 @@ FScreenPassTexture FGilbertShadersViewExtension::AddGilbertFullscreenPass(
         View.GetOverwriteLoadAction(),
         TEXT("GilbertShaders.Output"));
 
-    FGilbertFullscreenPS::FParameters* PassParameters =
-        GraphBuilder.AllocParameters<FGilbertFullscreenPS::FParameters>();
+    FGilbertPainterlyPS::FParameters* PassParameters =
+        GraphBuilder.AllocParameters<FGilbertPainterlyPS::FParameters>();
 
     PassParameters->InputTexture = InputSceneColor.Texture;
     PassParameters->InputSampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
@@ -77,12 +77,12 @@ FScreenPassTexture FGilbertShadersViewExtension::AddGilbertFullscreenPass(
     const FScreenPassTextureViewport InputViewport(InputSceneColor);
     const FScreenPassTextureViewport OutputViewport(Output);
 
-    TShaderMapRef<FGilbertFullscreenVS> VertexShader(GetGlobalShaderMap(View.GetFeatureLevel()));
-    TShaderMapRef<FGilbertFullscreenPS> PixelShader(GetGlobalShaderMap(View.GetFeatureLevel()));
+    TShaderMapRef<FGilbertPainterlyVS> VertexShader(GetGlobalShaderMap(View.GetFeatureLevel()));
+    TShaderMapRef<FGilbertPainterlyPS> PixelShader(GetGlobalShaderMap(View.GetFeatureLevel()));
 
     AddDrawScreenPass(
         GraphBuilder,
-        RDG_EVENT_NAME("GilbertShaders_FullscreenTint"),
+        RDG_EVENT_NAME("GilbertShaders_PainterlyTint"),
         View,
         OutputViewport,
         InputViewport,
@@ -90,7 +90,7 @@ FScreenPassTexture FGilbertShadersViewExtension::AddGilbertFullscreenPass(
         PixelShader,
         PassParameters);
 
-    UE_LOG(LogGilbertShadersViewExt, Warning, TEXT("GilbertShaders: Fullscreen pass submitted"));
+    UE_LOG(LogGilbertShadersViewExt, Warning, TEXT("GilbertShaders: Painterly pass submitted"));
 
     return MoveTemp(Output);
 }

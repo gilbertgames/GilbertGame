@@ -4,21 +4,21 @@
 #include "ShaderParameterStruct.h"
 #include "ScreenPass.h"
 
-class FGilbertFullscreenVS : public FGlobalShader
+class FGilbertPainterlyVS : public FGlobalShader
 {
 public:
-    DECLARE_GLOBAL_SHADER(FGilbertFullscreenVS);
-    SHADER_USE_PARAMETER_STRUCT(FGilbertFullscreenVS, FGlobalShader);
+    DECLARE_GLOBAL_SHADER(FGilbertPainterlyVS);
+    SHADER_USE_PARAMETER_STRUCT(FGilbertPainterlyVS, FGlobalShader);
 
     BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
     END_SHADER_PARAMETER_STRUCT()
 };
 
-class FGilbertFullscreenPS : public FGlobalShader
+class FGilbertPainterlyPS : public FGlobalShader
 {
 public:
-    DECLARE_GLOBAL_SHADER(FGilbertFullscreenPS);
-    SHADER_USE_PARAMETER_STRUCT(FGilbertFullscreenPS, FGlobalShader);
+    DECLARE_GLOBAL_SHADER(FGilbertPainterlyPS);
+    SHADER_USE_PARAMETER_STRUCT(FGilbertPainterlyPS, FGlobalShader);
 
     BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
         SHADER_PARAMETER_RDG_TEXTURE(Texture2D, InputTexture)

@@ -19,7 +19,7 @@ public:
         const FPostProcessMaterialInputs& Inputs);
 
 private:
-    FScreenPassTexture AddGilbertFullscreenPass(
+    FScreenPassTexture AddGilbertPainterlyPass(
         FRDGBuilder& GraphBuilder,
         const FSceneView& View,
         const FScreenPassTexture& InputSceneColor);
