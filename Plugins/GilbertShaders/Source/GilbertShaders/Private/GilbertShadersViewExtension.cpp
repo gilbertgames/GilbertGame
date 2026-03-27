@@ -59,8 +59,6 @@ FScreenPassTexture FGilbertShadersViewExtension::AddGilbertPainterlyPass(
     const FSceneView& View,
     const FScreenPassTexture& InputSceneColor)
 {
-    UE_LOG(LogGilbertShadersViewExt, Warning, TEXT("GilbertShaders: AddGilbertPainterlyPass"));
-
     FScreenPassRenderTarget Output = FScreenPassRenderTarget::CreateFromInput(
         GraphBuilder,
         InputSceneColor,
@@ -77,20 +75,18 @@ FScreenPassTexture FGilbertShadersViewExtension::AddGilbertPainterlyPass(
     const FScreenPassTextureViewport InputViewport(InputSceneColor);
     const FScreenPassTextureViewport OutputViewport(Output);
 
-    TShaderMapRef<FGilbertPainterlyVS> VertexShader(GetGlobalShaderMap(View.GetFeatureLevel()));
+    TShaderMapRef<FScreenPassVS> VertexShader(GetGlobalShaderMap(View.GetFeatureLevel()));
     TShaderMapRef<FGilbertPainterlyPS> PixelShader(GetGlobalShaderMap(View.GetFeatureLevel()));
 
     AddDrawScreenPass(
         GraphBuilder,
-        RDG_EVENT_NAME("GilbertShaders_PainterlyTint"),
+        RDG_EVENT_NAME("GilbertShaders_Painterly"),
         View,
         OutputViewport,
         InputViewport,
         VertexShader,
         PixelShader,
         PassParameters);
-
-    UE_LOG(LogGilbertShadersViewExt, Warning, TEXT("GilbertShaders: Painterly pass submitted"));
 
     return MoveTemp(Output);
 }

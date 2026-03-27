@@ -1,70 +1,10 @@
 #include "/Engine/Public/Platform.ush"
 
-struct VS_OUTPUT
-{
-    float4 Position : SV_POSITION;
-    float2 UV : TEXCOORD0;
-};
-
-VS_OUTPUT MainVS(uint VertexID : SV_VertexID)
-{
-    VS_OUTPUT Output;
-
-    float2 Positions[3] =
-    {
-        float2(-1, -1),
-        float2(-1, 3),
-        float2(3, -1)
-    };
-
-    float2 UVs[3] =
-    {
-        float2(0, 0),
-        float2(0, 2),
-        float2(2, 0)
-    };
-
-    Output.Position = float4(Positions[VertexID], 0, 1);
-    Output.UV = UVs[VertexID];
-
-    return Output;
-}
-
 Texture2D InputTexture;
 SamplerState InputSampler;
 
-float Luminance(float3 Color)
+float4 MainPS(float2 UV : TexCoord) : SV_Target0
 {
-    return dot(Color, float3(0.3, 0.59, 0.11));
-}
-
-float2 GetColorGradient(float2 UV)
-{
-    float2 TexelSize = float2(1.0 / 1920.0, 1.0 / 1080.0); // TEMP: replace later
-
-    float L = Luminance(InputTexture.Sample(InputSampler, UV - float2(TexelSize.x, 0)));
-    float R = Luminance(InputTexture.Sample(InputSampler, UV + float2(TexelSize.x, 0)));
-    float D = Luminance(InputTexture.Sample(InputSampler, UV - float2(0, TexelSize.y)));
-    float U = Luminance(InputTexture.Sample(InputSampler, UV + float2(0, TexelSize.y)));
-
-    float2 Grad;
-    Grad.x = R - L;
-    Grad.y = U - D;
-
-    return Grad;
-}
-
-float4 MainPS(VS_OUTPUT Input) : SV_Target0
-{
-    float2 UV = Input.UV;
-
-    float2 Grad = GetColorGradient(UV);
-    float Len = length(Grad);
-
-    float2 Dir = (Len > 1e-5) ? Grad / Len : float2(0, 0);
-
-    float2 Encoded = Dir * 0.5 + 0.5;
-    float Strength = saturate(Len * 5.0);
-
-    return float4(Encoded.x, Encoded.y, Strength, 1.0);
+    float3 Color = InputTexture.Sample(InputSampler, UV).rgb;
+    return float4(1.0 - Color, 1.0);
 }
