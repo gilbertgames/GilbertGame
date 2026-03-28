@@ -1,35 +1,297 @@
 #include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+#include "/Engine/Private/SceneTexturesCommon.ush"
 
-#define DEBUG_MODE 1 // 0 = luminance, 1 = gradient
+#define DEBUG_MODE 1
+// 0 = passthrough
+// 1 = painterly
+// 2 = kuwahara
+// 3 = direction
+// 4 = edge
+// 5 = anisotropy
+// 6 = radius
+// 7 = scene normal
 
-Texture2D InputTexture;
-SamplerState InputSampler;
+#define KUWAHARA_RADIUS 3
+#define KUWAHARA_ANISOTROPY 1.5
+#define KUWAHARA_HARDNESS 1.0
+#define KUWAHARA_SHARPNESS 6.0
 
-float2 InvViewportSize;
+#define DIRECTION_TENSOR_CENTER_WEIGHT 2.0
+#define DIRECTION_TENSOR_CARDINAL_WEIGHT 1.0
+#define DIRECTION_TENSOR_DIAGONAL_WEIGHT 0.75
+#define DIRECTION_TENSOR_EPSILON 1e-5
+
+// Keep these explicit so the shader stays self-consistent while we debug the
+// GBuffer path. The render-side parameter struct still binds the same names.
+Texture2D SceneColorTexture;
+SamplerState SceneColorSampler;
+
+float EdgeStrength;
+float EdgeThreshold;
+float EdgeSoftness;
+
+float NormalEdgeStrength;
+float NormalEdgeThreshold;
+float NormalEdgeSoftness;
+
+float2 GetBufferTexelSize()
+{
+    return View.BufferSizeAndInvSize.zw;
+}
+
+float3 SampleSceneColor(float2 UV)
+{
+    return SceneColorTexture.Sample(SceneColorSampler, UV).rgb;
+}
 
 float SampleLuma(float2 UV)
 {
-    float3 Color = InputTexture.Sample(InputSampler, UV).rgb;
-    return dot(Color, float3(0.299, 0.587, 0.114));
+    return dot(SampleSceneColor(UV), float3(0.299, 0.587, 0.114));
+}
+
+float3 SampleSceneNormal(float2 UV)
+{
+    float4 GBufferA = Texture2DSampleLevel(
+        SceneTexturesStruct.GBufferATexture,
+        SceneTexturesStruct.PointClampSampler,
+        UV,
+        0);
+
+    return normalize(GBufferA.xyz * 2.0 - 1.0);
+}
+
+float ComputeEdge(float2 UV)
+{
+    float2 Texel = GetBufferTexelSize();
+
+    float L = SampleLuma(UV - float2(Texel.x, 0));
+    float R = SampleLuma(UV + float2(Texel.x, 0));
+    float U = SampleLuma(UV - float2(0, Texel.y));
+    float D = SampleLuma(UV + float2(0, Texel.y));
+
+    float2 G = float2(R - L, D - U);
+    float Edge = length(G) * EdgeStrength;
+
+    return smoothstep(EdgeThreshold, EdgeThreshold + max(EdgeSoftness, 1e-5), Edge);
+}
+
+struct FDirectionData
+{
+    float2 Direction;
+    float Confidence;
+};
+
+struct FTensorSample
+{
+    float A;
+    float B;
+    float C;
+};
+
+FTensorSample ComputeTensorSample(float2 UV)
+{
+    float2 Texel = GetBufferTexelSize();
+
+    float3 NL = SampleSceneNormal(UV - float2(Texel.x, 0));
+    float3 NR = SampleSceneNormal(UV + float2(Texel.x, 0));
+    float3 NU = SampleSceneNormal(UV - float2(0, Texel.y));
+    float3 ND = SampleSceneNormal(UV + float2(0, Texel.y));
+
+    float3 dNdx = (NR - NL) * 0.5;
+    float3 dNdy = (ND - NU) * 0.5;
+
+    float Gx = length(dNdx);
+    float Gy = length(dNdy);
+    float Gxy = dot(dNdx, dNdy);
+
+    FTensorSample T;
+    T.A = Gx * Gx;
+    T.B = Gxy;
+    T.C = Gy * Gy;
+    return T;
+}
+
+FDirectionData ComputeDirectionData(float2 UV)
+{
+    float2 Texel = GetBufferTexelSize();
+
+    float SumA = 0;
+    float SumB = 0;
+    float SumC = 0;
+    float WeightSum = 0;
+
+    for (int x = -1; x <= 1; x++)
+    {
+        for (int y = -1; y <= 1; y++)
+        {
+            float2 SampleUV = UV + float2(x, y) * Texel;
+            FTensorSample T = ComputeTensorSample(SampleUV);
+
+            float W = DIRECTION_TENSOR_DIAGONAL_WEIGHT;
+
+            if (x == 0 && y == 0)
+                W = DIRECTION_TENSOR_CENTER_WEIGHT;
+            else if (x == 0 || y == 0)
+                W = DIRECTION_TENSOR_CARDINAL_WEIGHT;
+
+            SumA += T.A * W;
+            SumB += T.B * W;
+            SumC += T.C * W;
+            WeightSum += W;
+        }
+    }
+
+    SumA /= max(WeightSum, DIRECTION_TENSOR_EPSILON);
+    SumB /= max(WeightSum, DIRECTION_TENSOR_EPSILON);
+    SumC /= max(WeightSum, DIRECTION_TENSOR_EPSILON);
+
+    float Trace = SumA + SumC;
+    float Det = sqrt(max((SumA - SumC) * (SumA - SumC) + 4.0 * SumB * SumB, 0));
+
+    float L1 = 0.5 * (Trace + Det);
+    float L2 = 0.5 * (Trace - Det);
+
+    float Coherence = (L1 - L2) / max(L1 + L2, DIRECTION_TENSOR_EPSILON);
+    Coherence = saturate(Coherence);
+
+    float Angle = 0.5 * atan2(2.0 * SumB, SumA - SumC);
+    float2 Dir = float2(cos(Angle), sin(Angle));
+
+    FDirectionData Out;
+    Out.Direction = Dir;
+    Out.Confidence = Coherence;
+    return Out;
+}
+
+float3 DebugDirection(float2 UV)
+{
+    FDirectionData D = ComputeDirectionData(UV);
+    return float3(D.Direction * 0.5 + 0.5, 0);
+}
+
+float3 DebugSceneNormal(float2 UV)
+{
+    return SampleSceneNormal(UV) * 0.5 + 0.5;
+}
+
+float ComputeAnisotropy(float2 UV)
+{
+    return ComputeDirectionData(UV).Confidence;
+}
+
+float ComputeRadiusMask(float2 UV)
+{
+    return 1.0 - ComputeEdge(UV);
+}
+
+float3 ApplyKuwahara(float2 UV)
+{
+    FDirectionData D = ComputeDirectionData(UV);
+
+    float2 Dir = D.Direction;
+    float2 Perp = float2(-Dir.y, Dir.x);
+
+    float Radius = KUWAHARA_RADIUS;
+    float Major = Radius * lerp(1.0, KUWAHARA_ANISOTROPY, D.Confidence);
+    float Minor = Radius;
+
+    float3 Mean[4];
+    float3 MeanSq[4];
+    float WeightSum[4];
+
+    [unroll]
+    for (int i = 0; i < 4; i++)
+    {
+        Mean[i] = 0;
+        MeanSq[i] = 0;
+        WeightSum[i] = 0;
+    }
+
+    for (int x = -KUWAHARA_RADIUS; x <= KUWAHARA_RADIUS; x++)
+    {
+        for (int y = -KUWAHARA_RADIUS; y <= KUWAHARA_RADIUS; y++)
+        {
+            float2 P = float2(x, y);
+
+            float Along = dot(P, Dir);
+            float Across = dot(P, Perp);
+
+            float Ellipse =
+                (Along * Along) / (Major * Major) +
+                (Across * Across) / (Minor * Minor);
+
+            if (Ellipse > 1.0)
+                continue;
+
+            float2 UVOffset = P * GetBufferTexelSize();
+            float3 C = SampleSceneColor(UV + UVOffset);
+
+            float W = saturate(1.0 - Ellipse);
+
+            float W0 = saturate(Along) * W;
+            float W1 = saturate(-Along) * W;
+            float W2 = saturate(Across) * W;
+            float W3 = saturate(-Across) * W;
+
+            Mean[0] += C * W0;
+            MeanSq[0] += C * C * W0;
+            WeightSum[0] += W0;
+            Mean[1] += C * W1;
+            MeanSq[1] += C * C * W1;
+            WeightSum[1] += W1;
+            Mean[2] += C * W2;
+            MeanSq[2] += C * C * W2;
+            WeightSum[2] += W2;
+            Mean[3] += C * W3;
+            MeanSq[3] += C * C * W3;
+            WeightSum[3] += W3;
+        }
+    }
+
+    float3 Final = 0;
+    float FinalW = 0;
+
+    [unroll]
+    for (int i = 0; i < 4; i++)
+    {
+        float W = max(WeightSum[i], 1e-5);
+        float3 M = Mean[i] / W;
+        float3 V = max(MeanSq[i] / W - M * M, 0);
+        float Var = V.r + V.g + V.b;
+
+        float Blend = 1.0 / (1.0 + Var * KUWAHARA_SHARPNESS);
+
+        Final += M * Blend;
+        FinalW += Blend;
+    }
+
+    return Final / max(FinalW, 1e-5);
 }
 
 float4 MainPS(float2 UV : TexCoord) : SV_Target0
 {
+    float3 Base = SampleSceneColor(UV);
+    float3 Kuwahara = ApplyKuwahara(UV);
+
 #if DEBUG_MODE == 0
-    float Luma = SampleLuma(UV);
-    return float4(Luma, Luma, Luma, 1.0);
+    return float4(Base, 1);
+#elif DEBUG_MODE == 1
+    return float4(Kuwahara, 1);
+#elif DEBUG_MODE == 2
+    return float4(Kuwahara, 1);
+#elif DEBUG_MODE == 3
+    return float4(DebugDirection(UV), 1);
+#elif DEBUG_MODE == 4
+    return float4(ComputeEdge(UV).xxx, 1);
+#elif DEBUG_MODE == 5
+    return float4(ComputeAnisotropy(UV).xxx, 1);
+#elif DEBUG_MODE == 6
+    return float4(ComputeRadiusMask(UV).xxx, 1);
+#elif DEBUG_MODE == 7
+    return float4(DebugSceneNormal(UV), 1);
 #else
-    float2 Texel = InvViewportSize;
-
-    float Left = SampleLuma(UV - float2(Texel.x, 0.0));
-    float Right = SampleLuma(UV + float2(Texel.x, 0.0));
-    float Up = SampleLuma(UV - float2(0.0, Texel.y));
-    float Down = SampleLuma(UV + float2(0.0, Texel.y));
-
-    float Dx = Right - Left;
-    float Dy = Down - Up;
-    float Gradient = saturate(sqrt(Dx * Dx + Dy * Dy) * 4.0);
-
-    return float4(Gradient.xxx, 1.0);
+    return float4(1, 0, 1, 1);
 #endif
 }

@@ -13,7 +13,7 @@ public:
         FAfterPassCallbackDelegateArray& InOutPassCallbacks,
         bool bIsPassEnabled) override;
 
-    FScreenPassTexture AfterTonemap_RenderThread(
+    FScreenPassTexture PostProcessPass_RenderThread(
         FRDGBuilder& GraphBuilder,
         const FSceneView& View,
         const FPostProcessMaterialInputs& Inputs);
@@ -22,5 +22,6 @@ private:
     FScreenPassTexture AddGilbertPainterlyPass(
         FRDGBuilder& GraphBuilder,
         const FSceneView& View,
+        const FPostProcessMaterialInputs& Inputs,
         const FScreenPassTexture& InputSceneColor);
 };

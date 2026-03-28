@@ -9,8 +9,14 @@
 #include "RenderGraphUtils.h"
 #include "ScreenPass.h"
 #include "GlobalShader.h"
+#include "SceneRenderTargetParameters.h"
+
+
 
 DEFINE_LOG_CATEGORY_STATIC(LogGilbertShadersViewExt, Log, All);
+
+#define GILBERT_TEST_PASS EPostProcessingPass::AfterDOF
+
 
 FGilbertShadersViewExtension::FGilbertShadersViewExtension(const FAutoRegister& AutoRegister)
     : FSceneViewExtensionBase(AutoRegister)
@@ -24,23 +30,23 @@ void FGilbertShadersViewExtension::SubscribeToPostProcessingPass(
     FAfterPassCallbackDelegateArray& InOutPassCallbacks,
     bool bIsPassEnabled)
 {
-    if (Pass == EPostProcessingPass::Tonemap)
+    if (Pass == GILBERT_TEST_PASS)
     {
-        UE_LOG(LogGilbertShadersViewExt, Warning, TEXT("GilbertShaders: Subscribing to Tonemap pass"));
+        UE_LOG(LogGilbertShadersViewExt, Warning, TEXT("GilbertShaders: Subscribing to test post-process pass"));
 
         InOutPassCallbacks.Add(
             FAfterPassCallbackDelegate::CreateRaw(
                 this,
-                &FGilbertShadersViewExtension::AfterTonemap_RenderThread));
+                &FGilbertShadersViewExtension::PostProcessPass_RenderThread));
     }
 }
 
-FScreenPassTexture FGilbertShadersViewExtension::AfterTonemap_RenderThread(
+FScreenPassTexture FGilbertShadersViewExtension::PostProcessPass_RenderThread(
     FRDGBuilder& GraphBuilder,
     const FSceneView& View,
     const FPostProcessMaterialInputs& Inputs)
 {
-    UE_LOG(LogGilbertShadersViewExt, Warning, TEXT("GilbertShaders: AfterTonemap_RenderThread hit"));
+    UE_LOG(LogGilbertShadersViewExt, Warning, TEXT("GilbertShaders: PostProcessPass_RenderThread hit"));
 
     const FScreenPassTexture SceneColor(Inputs.GetInput(EPostProcessMaterialInput::SceneColor));
 
@@ -51,12 +57,13 @@ FScreenPassTexture FGilbertShadersViewExtension::AfterTonemap_RenderThread(
     }
 
     UE_LOG(LogGilbertShadersViewExt, Warning, TEXT("GilbertShaders: SceneColor valid, adding painterly pass"));
-    return AddGilbertPainterlyPass(GraphBuilder, View, SceneColor);
+    return AddGilbertPainterlyPass(GraphBuilder, View, Inputs, SceneColor);
 }
 
 FScreenPassTexture FGilbertShadersViewExtension::AddGilbertPainterlyPass(
     FRDGBuilder& GraphBuilder,
     const FSceneView& View,
+    const FPostProcessMaterialInputs& Inputs,
     const FScreenPassTexture& InputSceneColor)
 {
     FScreenPassRenderTarget Output = FScreenPassRenderTarget::CreateFromInput(
@@ -65,23 +72,34 @@ FScreenPassTexture FGilbertShadersViewExtension::AddGilbertPainterlyPass(
         View.GetOverwriteLoadAction(),
         TEXT("GilbertShaders.Output"));
 
+    const FScreenPassTextureViewport InputViewport(InputSceneColor);
+
+
     FGilbertPainterlyPS::FParameters* PassParameters =
         GraphBuilder.AllocParameters<FGilbertPainterlyPS::FParameters>();
 
+    PassParameters->InputViewport = GetScreenPassTextureViewportParameters(InputViewport);
+    PassParameters->View = View.ViewUniformBuffer;
+    PassParameters->SceneTextures = CreateSceneTextureShaderParameters(
+        GraphBuilder,
+        View,
+        ESceneTextureSetupMode::All);
 
+    PassParameters->SceneColorTexture = InputSceneColor.Texture;
+    PassParameters->SceneColorSampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
 
-    const FIntRect ViewRect = View.UnconstrainedViewRect;
-    const float ViewportWidth = float(ViewRect.Width());
-    const float ViewportHeight = float(ViewRect.Height());
-
-    PassParameters->InputTexture = InputSceneColor.Texture;
-    PassParameters->InputSampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
     PassParameters->RenderTargets[0] = Output.GetRenderTargetBinding();
-    PassParameters->InvViewportSize = FVector2f(1.0f / ViewportWidth, 1.0f / ViewportHeight);
+
+    PassParameters->EdgeStrength = 4.0f;
+    PassParameters->EdgeThreshold = 0.08f;
+    PassParameters->EdgeSoftness = 0.04f;
+
+    PassParameters->NormalEdgeStrength = 1.0f;
+    PassParameters->NormalEdgeThreshold = 0.75f;
+    PassParameters->NormalEdgeSoftness = 0.12f;
 
 
 
-    const FScreenPassTextureViewport InputViewport(InputSceneColor);
     const FScreenPassTextureViewport OutputViewport(Output);
 
     TShaderMapRef<FScreenPassVS> VertexShader(GetGlobalShaderMap(View.GetFeatureLevel()));
