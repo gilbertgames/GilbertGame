@@ -1,0 +1,99 @@
+#pragma once
+
+//////////////////////////////////////////////////////////////
+// GILBERT COMMON
+// Shared math helpers and scene data accessors.
+// Include this in any Gilbert .ush or .usf that needs
+// scene texture reads or basic utility functions.
+//////////////////////////////////////////////////////////////
+
+//////////////////////////////////////////////////////////////
+// DEFAULTS
+// Override these in your .usf before including this file.
+//////////////////////////////////////////////////////////////
+
+#ifndef DEPTH_RADIUS_ENABLE
+#define DEPTH_RADIUS_ENABLE 0
+#endif
+
+#ifndef DEPTH_RADIUS_NEAR
+#define DEPTH_RADIUS_NEAR 1000.0
+#endif
+
+#ifndef DEPTH_RADIUS_FAR
+#define DEPTH_RADIUS_FAR 10000.0
+#endif
+
+#ifndef DEPTH_RADIUS_EXPONENT
+#define DEPTH_RADIUS_EXPONENT 1.5
+#endif
+
+//////////////////////////////////////////////////////////////
+// MATH HELPERS
+//////////////////////////////////////////////////////////////
+
+float SafeRcp(float X)
+{
+    return 1.0 / max(X, 1e-6);
+}
+
+//////////////////////////////////////////////////////////////
+// SCENE ACCESSORS
+//////////////////////////////////////////////////////////////
+
+float3 GetWorldNormal(float2 UV)
+{
+    float4 GBufferA = Texture2DSampleLevel(
+        SceneTexturesStruct.GBufferATexture,
+        SceneTexturesStruct.PointClampSampler,
+        UV,
+        0);
+
+    float3 N = GBufferA.xyz * 2.0 - 1.0;
+    return normalize(N);
+}
+
+float3 GetSceneColor(float2 UV)
+{
+    float4 SceneColor = Texture2DSampleLevel(
+        SceneTexturesStruct.SceneColorTexture,
+        SceneTexturesStruct.PointClampSampler,
+        UV,
+        0);
+
+    return SceneColor.rgb;
+}
+
+float GetSceneLuma(float2 UV)
+{
+    float3 Color = GetSceneColor(UV);
+    return dot(Color, float3(0.299, 0.587, 0.114));
+}
+
+float GetSceneDepthDeviceZ(float2 UV)
+{
+    float SceneDepth = Texture2DSampleLevel(
+        SceneTexturesStruct.SceneDepthTexture,
+        SceneTexturesStruct.PointClampSampler,
+        UV,
+        0).r;
+
+    return SceneDepth;
+}
+
+float GetSceneDepthWorld(float2 UV)
+{
+    float DeviceZ = GetSceneDepthDeviceZ(UV);
+    return ConvertFromDeviceZ(DeviceZ);
+}
+
+float GetDepthRadiusFactor(float2 UV)
+{
+#if DEPTH_RADIUS_ENABLE
+    float Depth = GetSceneDepthWorld(UV);
+    float T = saturate((Depth - DEPTH_RADIUS_NEAR) / max(DEPTH_RADIUS_FAR - DEPTH_RADIUS_NEAR, 1.0));
+    return pow(T, DEPTH_RADIUS_EXPONENT);
+#else
+    return 0.0;
+#endif
+}

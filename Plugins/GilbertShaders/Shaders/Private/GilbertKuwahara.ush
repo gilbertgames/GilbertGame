@@ -1,0 +1,328 @@
+#pragma once
+
+#include "/GilbertShaders/Private/GilbertCommon.ush"
+#include "/GilbertShaders/Private/GilbertTensor.ush"
+
+//////////////////////////////////////////////////////////////
+// GILBERT KUWAHARA
+// Tensor-driven anisotropic generalized Kuwahara filter,
+// detail reintroduction, and final composite.
+// Depends on: GilbertCommon.ush, GilbertTensor.ush
+//////////////////////////////////////////////////////////////
+
+//////////////////////////////////////////////////////////////
+// DEFAULTS
+// Override these in your .usf before including this file.
+//////////////////////////////////////////////////////////////
+
+#ifndef KUWAHARA_BASE_RADIUS
+#define KUWAHARA_BASE_RADIUS 0
+#endif
+
+#ifndef KUWAHARA_MIN_RADIUS
+#define KUWAHARA_MIN_RADIUS 4
+#endif
+
+#ifndef KUWAHARA_MAX_RADIUS
+#define KUWAHARA_MAX_RADIUS 8
+#endif
+
+#ifndef KUWAHARA_MAX_STRETCH
+#define KUWAHARA_MAX_STRETCH 5.0
+#endif
+
+#ifndef KUWAHARA_MIN_ANISOTROPY
+#define KUWAHARA_MIN_ANISOTROPY 0.01
+#endif
+
+#ifndef KUWAHARA_MIN_TRACE
+#define KUWAHARA_MIN_TRACE 0.0005
+#endif
+
+#ifndef DETAIL_REINTRODUCTION_ENABLE
+#define DETAIL_REINTRODUCTION_ENABLE 0
+#endif
+
+#ifndef DETAIL_REINTRODUCTION_STRENGTH
+#define DETAIL_REINTRODUCTION_STRENGTH 0.5
+#endif
+
+#ifndef DETAIL_DEPTH_FALLOFF_ENABLE
+#define DETAIL_DEPTH_FALLOFF_ENABLE 0
+#endif
+
+#ifndef DETAIL_DEPTH_FALLOFF_MIN
+#define DETAIL_DEPTH_FALLOFF_MIN 0.1
+#endif
+
+#ifndef DETAIL_DEPTH_FALLOFF_MAX
+#define DETAIL_DEPTH_FALLOFF_MAX 0.8
+#endif
+
+#ifndef DETAIL_COLOR_ONLY_ENABLE
+#define DETAIL_COLOR_ONLY_ENABLE 0
+#endif
+
+//////////////////////////////////////////////////////////////
+// DETAIL HELPERS
+//////////////////////////////////////////////////////////////
+
+float3 GetSmallBlurredSceneColor(float2 UV)
+{
+    float2 TexelSize = View.BufferSizeAndInvSize.zw;
+
+    float Weights[9] =
+    {
+        1.0, 2.0, 1.0,
+        2.0, 4.0, 2.0,
+        1.0, 2.0, 1.0
+    };
+
+    float3 Sum = 0.0;
+    float WeightSum = 0.0;
+    int Index = 0;
+
+    [unroll]
+    for (int Y = -1; Y <= 1; ++Y)
+    {
+        [unroll]
+        for (int X = -1; X <= 1; ++X)
+        {
+            float Weight = Weights[Index];
+            float2 Offset = float2(X, Y) * TexelSize;
+
+            Sum += GetSceneColor(UV + Offset) * Weight;
+            WeightSum += Weight;
+            Index++;
+        }
+    }
+
+    return Sum * SafeRcp(WeightSum);
+}
+
+float3 GetHighFrequencyDetail(float2 UV)
+{
+    float3 Source       = GetSceneColor(UV);
+    float3 LowFrequency = GetSmallBlurredSceneColor(UV);
+    return Source - LowFrequency;
+}
+
+float3 GetColorOnlyHighFrequencyDetail(float2 UV)
+{
+    float3 Source       = GetSceneColor(UV);
+    float3 LowFrequency = GetSmallBlurredSceneColor(UV);
+
+    float SourceLuma = dot(Source,       float3(0.299, 0.587, 0.114));
+    float LowLuma    = dot(LowFrequency, float3(0.299, 0.587, 0.114));
+
+    float3 SourceChroma = Source       - SourceLuma.xxx;
+    float3 LowChroma    = LowFrequency - LowLuma.xxx;
+
+    return SourceChroma - LowChroma;
+}
+
+float GetDetailDepthMask(float2 UV)
+{
+#if DETAIL_DEPTH_FALLOFF_ENABLE
+    float DepthFactor = GetDepthRadiusFactor(UV);
+    return lerp(DETAIL_DEPTH_FALLOFF_MAX, DETAIL_DEPTH_FALLOFF_MIN, DepthFactor);
+#else
+    return 1.0;
+#endif
+}
+
+//////////////////////////////////////////////////////////////
+// KUWAHARA CORE — Generalized Anisotropic Sector Kuwahara
+//
+// Replaces the old hard-quadrant approach with 8 smooth,
+// Gaussian-weighted, elliptical sectors oriented along the
+// structure tensor. Each sector accumulates a weighted mean
+// and variance; the final color is a soft blend across all
+// sectors weighted by inverse variance — no hard winner-pick,
+// so no blobby artifacts at higher radii.
+//////////////////////////////////////////////////////////////
+
+#define KUWAHARA_SECTOR_COUNT 8
+
+// Gaussian falloff sharpness within each sector.
+// Higher = tighter weighting toward sector center.
+#ifndef KUWAHARA_GAUSSIAN_SHARPNESS
+#define KUWAHARA_GAUSSIAN_SHARPNESS 8.0
+#endif
+
+// Sharpness of the inverse-variance blend across sectors.
+// Higher = harder transitions between stroke regions (more graphic/painted).
+// Lower  = softer blending (more watercolor-like).
+#ifndef KUWAHARA_VARIANCE_BLEND_SHARPNESS
+#define KUWAHARA_VARIANCE_BLEND_SHARPNESS 8.0
+#endif
+
+float3 ApplyGeneralizedKuwahara(float2 UV, FDirectionData DirectionData, out float KernelAspect, out float DepthRadiusFactor)
+{
+    float2 TexelSize = View.BufferSizeAndInvSize.zw;
+
+    // --- Trust and effective anisotropy ---
+    float TraceTrust          = saturate((DirectionData.Trace - KUWAHARA_MIN_TRACE) / max(KUWAHARA_MIN_TRACE, 1e-6));
+    float AnisoTrust          = (DirectionData.Anisotropy < KUWAHARA_MIN_ANISOTROPY) ? 0.0 : DirectionData.Anisotropy;
+    float EffectiveAnisotropy = AnisoTrust * TraceTrust;
+
+    // --- Radius ---
+    DepthRadiusFactor  = GetDepthRadiusFactor(UV);
+    float BaseRadius   = lerp((float)KUWAHARA_MIN_RADIUS, (float)KUWAHARA_MAX_RADIUS, DepthRadiusFactor);
+
+    // --- Ellipse shape matrix S (paper section 3.2) ---
+    // S scales the kernel ellipse based on anisotropy.
+    // Alpha=1 gives max eccentricity of 4 as per the paper.
+    // In isotropic regions S approaches identity (circle).
+    // In anisotropic regions it becomes a stretched ellipse.
+    float Alpha  = 1.0;
+    float ScaleX = Alpha / max(Alpha + EffectiveAnisotropy, 1e-6); // short axis (across strokes)
+    float ScaleY = (Alpha + EffectiveAnisotropy) / max(Alpha, 1e-6); // long axis (along strokes)
+
+    // Clamp so we don't exceed our radius budget
+    float RadiusX = clamp(BaseRadius * ScaleY, (float)KUWAHARA_MIN_RADIUS, (float)KUWAHARA_MAX_RADIUS);
+    float RadiusY = clamp(BaseRadius * ScaleX, (float)KUWAHARA_MIN_RADIUS, (float)KUWAHARA_MAX_RADIUS);
+
+    KernelAspect = RadiusX * SafeRcp(max(RadiusY, 1.0));
+
+    // --- Rotation matrix R_phi aligned to tensor direction ---
+    float    Phi            = DirectionData.Angle;
+    float2x2 RotationMatrix = float2x2(cos(Phi), -sin(Phi), sin(Phi), cos(Phi));
+
+    // --- Per-sector accumulators ---
+    // We accumulate weighted mean and weighted mean-of-squares per sector.
+    // Each sample contributes to ALL sectors with a smooth angular weight,
+    // not just one — this is what eliminates the hard quadrant artifacts.
+    float3 SectorM1[KUWAHARA_SECTOR_COUNT];   // weighted sum of color
+    float3 SectorM2[KUWAHARA_SECTOR_COUNT];   // weighted sum of color^2
+    float  SectorW[KUWAHARA_SECTOR_COUNT];    // total weight
+
+    [unroll]
+    for (int s = 0; s < KUWAHARA_SECTOR_COUNT; s++)
+    {
+        SectorM1[s] = float3(0, 0, 0);
+        SectorM2[s] = float3(0, 0, 0);
+        SectorW[s]  = 0.0;
+    }
+
+    int SampleRadius = (int)ceil(max(RadiusX, RadiusY));
+
+    for (int Y = -SampleRadius; Y <= SampleRadius; Y++)
+    {
+        for (int X = -SampleRadius; X <= SampleRadius; X++)
+        {
+            // Transform sample offset into ellipse-aligned space:
+            // first rotate by phi, then scale by ellipse axes
+            float2 V           = mul(float2(X, Y), RotationMatrix);
+            float2 EllipsePos  = float2(V.x / max(RadiusX, 1e-6),
+                                        V.y / max(RadiusY, 1e-6));
+            float  EllipseDist = dot(EllipsePos, EllipsePos);
+
+            // Reject samples outside the ellipse
+            if (EllipseDist > 1.0)
+                continue;
+
+            // Radial Gaussian weight — falls off toward ellipse boundary.
+            // This is the Gr term from the paper.
+            float GaussRadial = exp(-KUWAHARA_GAUSSIAN_SHARPNESS * EllipseDist);
+
+            float3 PixelColor = GetSceneColor(UV + float2(X, Y) * TexelSize);
+
+            // Angular weight per sector — smooth overlap between sectors.
+            // Each sector i is centered at angle (2*pi*i / N).
+            // We use a cosine lobe so adjacent sectors share samples smoothly.
+            // This approximates the convolved characteristic function Ki from the paper.
+            float SampleAngle = atan2(V.y, V.x);
+
+            [unroll]
+            for (int s = 0; s < KUWAHARA_SECTOR_COUNT; s++)
+            {
+                float SectorCenter  = (2.0 * 3.14159265 * (float)s) / (float)KUWAHARA_SECTOR_COUNT;
+                float AngleDelta    = SampleAngle - SectorCenter;
+
+                // Wrap angle delta into [-pi, pi]
+                AngleDelta = AngleDelta - round(AngleDelta / (2.0 * 3.14159265)) * (2.0 * 3.14159265);
+
+                // Cosine lobe: positive over this sector's arc, smoothly zero at neighbors.
+                // The sector arc is 2*pi/N, so the half-arc is pi/N.
+                // cos^2 gives a smooth bell centered on the sector.
+                float SectorHalfArc  = 3.14159265 / (float)KUWAHARA_SECTOR_COUNT;
+                float AngularWeight  = max(cos(AngleDelta * (0.5 / SectorHalfArc) * 3.14159265 * 0.5), 0.0);
+                AngularWeight        = AngularWeight * AngularWeight; // cos^2 for smoother overlap
+
+                float W = GaussRadial * AngularWeight;
+
+                SectorM1[s] += PixelColor * W;
+                SectorM2[s] += PixelColor * PixelColor * W;
+                SectorW[s]  += W;
+            }
+        }
+    }
+
+    // --- Finalize mean and variance per sector, then blend ---
+    // Alpha_i = 1 / (1 + ||sigma_i||^q) — paper equation, section 3.2
+    // Sectors crossing edges have high variance, so they get low alpha.
+    float3 BlendedColor = float3(0, 0, 0);
+    float  TotalAlpha   = 0.0;
+
+    [unroll]
+    for (int s = 0; s < KUWAHARA_SECTOR_COUNT; s++)
+    {
+        float  InvW        = SafeRcp(max(SectorW[s], 1e-6));
+        float3 Mean        = SectorM1[s] * InvW;
+        float3 MeanSq      = SectorM2[s] * InvW;
+
+        // Variance per channel, summed — ||sigma_i||
+        float3 Variance    = max(MeanSq - Mean * Mean, 0.0);
+        float  SigmaNorm   = sqrt(Variance.r + Variance.g + Variance.b);
+
+        // Paper: alpha_i = 1 / (1 + ||s_i||^q), q = KUWAHARA_VARIANCE_BLEND_SHARPNESS
+        float  Alpha_i     = SafeRcp(1.0 + pow(SigmaNorm, KUWAHARA_VARIANCE_BLEND_SHARPNESS));
+
+        BlendedColor += Mean * Alpha_i;
+        TotalAlpha   += Alpha_i;
+    }
+
+    BlendedColor *= SafeRcp(TotalAlpha);
+
+    // Blend toward passthrough in low-signal / isotropic regions
+    return lerp(GetSceneColor(UV), BlendedColor, lerp(0.35, 1.0, EffectiveAnisotropy));
+}
+
+//////////////////////////////////////////////////////////////
+// COMPOSITE
+//////////////////////////////////////////////////////////////
+
+float3 ComposeFinalPainterlyColor(float2 UV, float3 KuwaharaColor)
+{
+#if DETAIL_REINTRODUCTION_ENABLE
+    float3 Detail = 0.0;
+
+#if DETAIL_COLOR_ONLY_ENABLE
+    Detail = GetColorOnlyHighFrequencyDetail(UV);
+#else
+    Detail = GetHighFrequencyDetail(UV);
+#endif
+
+    float DetailMask  = GetDetailDepthMask(UV);
+    float3 FinalColor = KuwaharaColor + Detail * (DETAIL_REINTRODUCTION_STRENGTH * DetailMask);
+    return max(FinalColor, 0.0);
+#else
+    return KuwaharaColor;
+#endif
+}
+
+//////////////////////////////////////////////////////////////
+// KUWAHARA DEBUG
+//////////////////////////////////////////////////////////////
+
+float3 DebugKernelAspect(float Aspect)
+{
+    float T = saturate((Aspect - 1.0) / max(KUWAHARA_MAX_STRETCH - 1.0, 1e-5));
+    return float3(T, T, T);
+}
+
+float3 DebugDepthRadiusFactor(float T)
+{
+    return float3(T, T, T);
+}

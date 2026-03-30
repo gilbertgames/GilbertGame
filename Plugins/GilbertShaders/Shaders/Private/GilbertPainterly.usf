@@ -2,489 +2,48 @@
 #include "/Engine/Private/Common.ush"
 
 //////////////////////////////////////////////////////////////
-// CONFIG
+// CONFIG OVERRIDES
+// Defaults live in each .ush file. Only specify values here
+// that you want to deviate from those defaults.
 //////////////////////////////////////////////////////////////
 
-#define TENSOR_EPSILON 1e-5
+// -- Uncomment and set any overrides below --
+// #define KUWAHARA_MAX_RADIUS 8
+// #define TENSOR_SOURCE TENSOR_SOURCE_SCENECOLOR
+// #define TENSOR_NORMAL_BLEND 0.5
+// #define DEPTH_RADIUS_ENABLE 0
+// #define DETAIL_REINTRODUCTION_ENABLE 0
 
-// Kuwahara tuning
-#define KUWAHARA_BASE_RADIUS 0
-#define KUWAHARA_MIN_RADIUS 1
-#define KUWAHARA_MAX_RADIUS 4
-#define KUWAHARA_MAX_STRETCH 5.0
-#define KUWAHARA_MIN_ANISOTROPY 0.01
-#define KUWAHARA_MIN_TRACE 0.0005
+//////////////////////////////////////////////////////////////
+// DEBUG MODE
+// These stay here since they are only relevant to the
+// entry point, not the helper libraries.
+//////////////////////////////////////////////////////////////
 
-// Tensor source toggle
-#define TENSOR_SOURCE_NORMALS 0
-#define TENSOR_SOURCE_SCENECOLOR 1
-#define TENSOR_SOURCE_HYBRID 2
-#define TENSOR_SOURCE TENSOR_SOURCE_HYBRID
-
-// In hybrid mode, 0.0 = pure scene color, 1.0 = pure normals
-#define TENSOR_NORMAL_BLEND 0.75
-
-// Direction toggle for debugging
-#define ROTATE_TENSOR_DIRECTION_90 1
-
-// Depth-based stroke sizing
-#define DEPTH_RADIUS_ENABLE 1
-#define DEPTH_RADIUS_NEAR 1000.0
-#define DEPTH_RADIUS_FAR 10000.0
-#define DEPTH_RADIUS_EXPONENT 1.5
-
-// Detail reintroduction
-#define DETAIL_REINTRODUCTION_ENABLE 1
-#define DETAIL_REINTRODUCTION_STRENGTH 0.5
-
-// Depth-aware detail falloff
-#define DETAIL_DEPTH_FALLOFF_ENABLE 0
-#define DETAIL_DEPTH_FALLOFF_MIN 0.1
-#define DETAIL_DEPTH_FALLOFF_MAX 0.8
-
-// Color-only detail reintroduction
-#define DETAIL_COLOR_ONLY_ENABLE 0
-
-// Debug modes
-#define DEBUG_FINAL_OUTPUT 0
-#define DEBUG_TENSOR_DIRECTION 1
-#define DEBUG_TENSOR_ANISOTROPY 2
-#define DEBUG_KERNEL_ASPECT 3
+#define DEBUG_FINAL_OUTPUT        0
+#define DEBUG_TENSOR_DIRECTION    1
+#define DEBUG_TENSOR_ANISOTROPY   2
+#define DEBUG_KERNEL_ASPECT       3
 #define DEBUG_TENSOR_SOURCE_PREVIEW 4
-#define DEBUG_TENSOR_TRACE 5
-#define DEBUG_PASSTHROUGH 6
+#define DEBUG_TENSOR_TRACE        5
+#define DEBUG_PASSTHROUGH         6
 #define DEBUG_DEPTH_RADIUS_FACTOR 7
-#define DEBUG_DETAIL_ONLY 8
-#define DEBUG_LOW_FREQUENCY 9
-#define DEBUG_DETAIL_DEPTH_MASK 10
-#define DEBUG_COLOR_ONLY_DETAIL 11
+#define DEBUG_DETAIL_ONLY         8
+#define DEBUG_LOW_FREQUENCY       9
+#define DEBUG_DETAIL_DEPTH_MASK   10
+#define DEBUG_COLOR_ONLY_DETAIL   11
 
 #define DEBUG_MODE DEBUG_FINAL_OUTPUT
 
 //////////////////////////////////////////////////////////////
-// STRUCTS
+// INCLUDES
+// Any overrides above must come before these includes so the
+// .ush defaults are skipped where overridden via #ifndef.
 //////////////////////////////////////////////////////////////
 
-struct FTensorData
-{
-    float A;
-    float B;
-    float C;
-};
-
-struct FDirectionData
-{
-    float2 Direction;
-    float Angle;
-    float Anisotropy;
-    float Trace;
-};
-
-//////////////////////////////////////////////////////////////
-// HELPERS
-//////////////////////////////////////////////////////////////
-
-float SafeRcp(float X)
-{
-    return 1.0 / max(X, 1e-6);
-}
-
-float3 GetWorldNormal(float2 UV)
-{
-    float4 GBufferA = Texture2DSampleLevel(
-        SceneTexturesStruct.GBufferATexture,
-        SceneTexturesStruct.PointClampSampler,
-        UV,
-        0);
-
-    float3 N = GBufferA.xyz * 2.0 - 1.0;
-    return normalize(N);
-}
-
-float3 GetSceneColor(float2 UV)
-{
-    float4 SceneColor = Texture2DSampleLevel(
-        SceneTexturesStruct.SceneColorTexture,
-        SceneTexturesStruct.PointClampSampler,
-        UV,
-        0);
-
-    return SceneColor.rgb;
-}
-
-float GetSceneLuma(float2 UV)
-{
-    float3 Color = GetSceneColor(UV);
-    return dot(Color, float3(0.299, 0.587, 0.114));
-}
-
-float GetSceneDepthDeviceZ(float2 UV)
-{
-    float SceneDepth = Texture2DSampleLevel(
-        SceneTexturesStruct.SceneDepthTexture,
-        SceneTexturesStruct.PointClampSampler,
-        UV,
-        0).r;
-
-    return SceneDepth;
-}
-
-float GetSceneDepthWorld(float2 UV)
-{
-    float DeviceZ = GetSceneDepthDeviceZ(UV);
-    return ConvertFromDeviceZ(DeviceZ);
-}
-
-float GetDepthRadiusFactor(float2 UV)
-{
-#if DEPTH_RADIUS_ENABLE
-    float Depth = GetSceneDepthWorld(UV);
-    float T = saturate((Depth - DEPTH_RADIUS_NEAR) / max(DEPTH_RADIUS_FAR - DEPTH_RADIUS_NEAR, 1.0));
-    return pow(T, DEPTH_RADIUS_EXPONENT);
-#else
-    return 0.0;
-#endif
-}
-
-//////////////////////////////////////////////////////////////
-// DETAIL REINTRODUCTION HELPERS
-//////////////////////////////////////////////////////////////
-
-float3 GetSmallBlurredSceneColor(float2 UV)
-{
-    float2 TexelSize = View.BufferSizeAndInvSize.zw;
-
-    float Weights[9] =
-    {
-        1.0, 2.0, 1.0,
-        2.0, 4.0, 2.0,
-        1.0, 2.0, 1.0
-    };
-
-    float3 Sum = 0.0;
-    float WeightSum = 0.0;
-    int Index = 0;
-
-    [unroll]
-    for (int Y = -1; Y <= 1; ++Y)
-    {
-        [unroll]
-        for (int X = -1; X <= 1; ++X)
-        {
-            float Weight = Weights[Index];
-            float2 Offset = float2(X, Y) * TexelSize;
-
-            Sum += GetSceneColor(UV + Offset) * Weight;
-            WeightSum += Weight;
-            Index++;
-        }
-    }
-
-    return Sum * SafeRcp(WeightSum);
-}
-
-float3 GetHighFrequencyDetail(float2 UV)
-{
-    float3 Source = GetSceneColor(UV);
-    float3 LowFrequency = GetSmallBlurredSceneColor(UV);
-    return Source - LowFrequency;
-}
-
-float3 GetColorOnlyHighFrequencyDetail(float2 UV)
-{
-    float3 Source = GetSceneColor(UV);
-    float3 LowFrequency = GetSmallBlurredSceneColor(UV);
-
-    float SourceLuma = dot(Source, float3(0.299, 0.587, 0.114));
-    float LowLuma = dot(LowFrequency, float3(0.299, 0.587, 0.114));
-
-    float3 SourceChroma = Source - SourceLuma.xxx;
-    float3 LowChroma = LowFrequency - LowLuma.xxx;
-
-    return SourceChroma - LowChroma;
-}
-
-float GetDetailDepthMask(float2 UV)
-{
-#if DETAIL_DEPTH_FALLOFF_ENABLE
-    float DepthFactor = GetDepthRadiusFactor(UV);
-    return lerp(DETAIL_DEPTH_FALLOFF_MAX, DETAIL_DEPTH_FALLOFF_MIN, DepthFactor);
-#else
-    return 1.0;
-#endif
-}
-
-//////////////////////////////////////////////////////////////
-// TENSOR SOURCES
-//////////////////////////////////////////////////////////////
-
-FTensorData ComputeTensorSampleFromNormals(float2 UV, float2 TexelSize)
-{
-    float3 N = GetWorldNormal(UV);
-    float3 Nx = GetWorldNormal(UV + float2(TexelSize.x, 0.0));
-    float3 Ny = GetWorldNormal(UV + float2(0.0, TexelSize.y));
-
-    float3 dNdx = Nx - N;
-    float3 dNdy = Ny - N;
-
-    FTensorData T;
-    T.A = dot(dNdx, dNdx);
-    T.B = dot(dNdx, dNdy);
-    T.C = dot(dNdy, dNdy);
-    return T;
-}
-
-FTensorData ComputeTensorSampleFromSceneColor(float2 UV, float2 TexelSize)
-{
-    float SobelX[9] =
-    {
-        -1.0, -2.0, -1.0,
-                         0.0, 0.0, 0.0,
-                         1.0, 2.0, 1.0
-    };
-
-    float SobelY[9] =
-    {
-        -1.0, 0.0, 1.0,
-                        -2.0, 0.0, 2.0,
-                        -1.0, 0.0, 1.0
-    };
-
-    float GradientX = 0.0;
-    float GradientY = 0.0;
-    int Index = 0;
-
-    [unroll]
-    for (int X = -1; X <= 1; ++X)
-    {
-        [unroll]
-        for (int Y = -1; Y <= 1; ++Y)
-        {
-            float2 Offset = float2(X, Y) * TexelSize;
-            float Luma = GetSceneLuma(UV + Offset);
-
-            GradientX += Luma * SobelX[Index];
-            GradientY += Luma * SobelY[Index];
-            Index++;
-        }
-    }
-
-    FTensorData T;
-    T.A = GradientX * GradientX;
-    T.B = GradientX * GradientY;
-    T.C = GradientY * GradientY;
-    return T;
-}
-
-FTensorData BlendTensors(FTensorData ColorTensor, FTensorData NormalTensor, float NormalBlend)
-{
-    FTensorData T;
-    T.A = lerp(ColorTensor.A, NormalTensor.A, NormalBlend);
-    T.B = lerp(ColorTensor.B, NormalTensor.B, NormalBlend);
-    T.C = lerp(ColorTensor.C, NormalTensor.C, NormalBlend);
-    return T;
-}
-
-FTensorData ComputeTensorSample(float2 UV, float2 TexelSize)
-{
-#if TENSOR_SOURCE == TENSOR_SOURCE_SCENECOLOR
-    return ComputeTensorSampleFromSceneColor(UV, TexelSize);
-#elif TENSOR_SOURCE == TENSOR_SOURCE_HYBRID
-    FTensorData ColorTensor = ComputeTensorSampleFromSceneColor(UV, TexelSize);
-    FTensorData NormalTensor = ComputeTensorSampleFromNormals(UV, TexelSize);
-    return BlendTensors(ColorTensor, NormalTensor, TENSOR_NORMAL_BLEND);
-#else
-    return ComputeTensorSampleFromNormals(UV, TexelSize);
-#endif
-}
-
-float3 DebugTensorSourcePreview(float2 UV)
-{
-#if TENSOR_SOURCE == TENSOR_SOURCE_SCENECOLOR
-    float Luma = GetSceneLuma(UV);
-    return float3(Luma, Luma, Luma);
-#elif TENSOR_SOURCE == TENSOR_SOURCE_HYBRID
-    float3 N = GetWorldNormal(UV) * 0.5 + 0.5;
-    float Luma = GetSceneLuma(UV);
-    float3 LumaPreview = float3(Luma, Luma, Luma);
-    return lerp(LumaPreview, N, TENSOR_NORMAL_BLEND);
-#else
-    float3 N = GetWorldNormal(UV);
-    return N * 0.5 + 0.5;
-#endif
-}
-
-//////////////////////////////////////////////////////////////
-// TENSOR PIPELINE (NO BLUR - current stable path)
-//////////////////////////////////////////////////////////////
-
-FTensorData AccumulateStructureTensor(float2 UV, float2 TexelSize)
-{
-    return ComputeTensorSample(UV, TexelSize);
-}
-
-FDirectionData SolveTensorDirectionAndAnisotropy(FTensorData T)
-{
-    float A = T.A;
-    float B = T.B;
-    float C = T.C;
-
-    float Trace = A + C;
-    float Delta = sqrt(max((A - C) * (A - C) + 4.0 * B * B, 0.0));
-
-    float Lambda1 = 0.5 * (Trace + Delta);
-    float Lambda2 = 0.5 * (Trace - Delta);
-
-    float Angle = 0.5 * atan2(2.0 * B, A - C);
-    float2 Dir = float2(cos(Angle), sin(Angle));
-
-#if ROTATE_TENSOR_DIRECTION_90
-    Dir = float2(-Dir.y, Dir.x);
-#endif
-
-    FDirectionData Out;
-    Out.Direction = normalize(Dir);
-    Out.Angle = atan2(Out.Direction.y, Out.Direction.x);
-    Out.Anisotropy = saturate((Lambda1 - Lambda2) / max(Lambda1 + Lambda2, TENSOR_EPSILON));
-    Out.Trace = Trace;
-    return Out;
-}
-
-//////////////////////////////////////////////////////////////
-// RESTORED WORKING QUADRANT KUWAHARA CORE
-//////////////////////////////////////////////////////////////
-
-float4 GetKernelMeanAndVariance(float2 UV, float4 Range, float2x2 RotationMatrix)
-{
-    float2 TexelSize = View.BufferSizeAndInvSize.zw;
-    float3 Mean = float3(0, 0, 0);
-    float3 Variance = float3(0, 0, 0);
-    float Samples = 0.0;
-
-    for (int X = (int) Range.x; X <= (int) Range.y; X++)
-    {
-        for (int Y = (int) Range.z; Y <= (int) Range.w; Y++)
-        {
-            float2 Offset = mul(float2(X, Y) * TexelSize, RotationMatrix);
-            float3 PixelColor = GetSceneColor(UV + Offset);
-            Mean += PixelColor;
-            Variance += PixelColor * PixelColor;
-            Samples += 1.0;
-        }
-    }
-
-    Mean /= Samples;
-    Variance = Variance / Samples - Mean * Mean;
-    float TotalVariance = Variance.r + Variance.g + Variance.b;
-    return float4(Mean.r, Mean.g, Mean.b, TotalVariance);
-}
-
-float3 ApplyTensorDrivenQuadrantKuwahara(float2 UV, FDirectionData DirectionData, out float KernelAspect, out float DepthRadiusFactor)
-{
-    float TraceTrust = saturate((DirectionData.Trace - KUWAHARA_MIN_TRACE) / max(KUWAHARA_MIN_TRACE, 1e-6));
-    float AnisoTrust = (DirectionData.Anisotropy < KUWAHARA_MIN_ANISOTROPY) ? 0.0 : DirectionData.Anisotropy;
-    float EffectiveAnisotropy = AnisoTrust * TraceTrust;
-
-    DepthRadiusFactor = GetDepthRadiusFactor(UV);
-
-    // Depth chooses base stroke size. Anisotropy chooses shape/stretch.
-    float BaseRadius = lerp((float) KUWAHARA_MIN_RADIUS, (float) KUWAHARA_MAX_RADIUS, DepthRadiusFactor);
-    BaseRadius = lerp((float) KUWAHARA_BASE_RADIUS, BaseRadius, 1.0);
-
-    float Stretch = lerp(1.0, KUWAHARA_MAX_STRETCH, EffectiveAnisotropy);
-
-    int XRadius = (int) round(clamp(BaseRadius * Stretch, (float) KUWAHARA_MIN_RADIUS, (float) KUWAHARA_MAX_RADIUS));
-    int YRadius = (int) round(clamp(BaseRadius / Stretch, (float) KUWAHARA_MIN_RADIUS, (float) KUWAHARA_MAX_RADIUS));
-
-    KernelAspect = (float) XRadius * SafeRcp(max((float) YRadius, 1.0));
-
-    float Angle = DirectionData.Angle;
-    float2x2 RotationMatrix = float2x2(cos(Angle), -sin(Angle), sin(Angle), cos(Angle));
-
-    float4 MeanAndVariance[4];
-    float4 Range;
-
-    Range = float4(-XRadius, 0, -YRadius, 0);
-    MeanAndVariance[0] = GetKernelMeanAndVariance(UV, Range, RotationMatrix);
-
-    Range = float4(0, XRadius, -YRadius, 0);
-    MeanAndVariance[1] = GetKernelMeanAndVariance(UV, Range, RotationMatrix);
-
-    Range = float4(-XRadius, 0, 0, YRadius);
-    MeanAndVariance[2] = GetKernelMeanAndVariance(UV, Range, RotationMatrix);
-
-    Range = float4(0, XRadius, 0, YRadius);
-    MeanAndVariance[3] = GetKernelMeanAndVariance(UV, Range, RotationMatrix);
-
-    float3 FinalColor = MeanAndVariance[0].rgb;
-    float MinimumVariance = MeanAndVariance[0].a;
-
-    [unroll]
-    for (int i = 1; i < 4; ++i)
-    {
-        if (MeanAndVariance[i].a < MinimumVariance)
-        {
-            FinalColor = MeanAndVariance[i].rgb;
-            MinimumVariance = MeanAndVariance[i].a;
-        }
-    }
-
-    return lerp(GetSceneColor(UV), FinalColor, lerp(0.35, 1.0, EffectiveAnisotropy));
-}
-
-//////////////////////////////////////////////////////////////
-// COMPOSITE
-//////////////////////////////////////////////////////////////
-
-float3 ComposeFinalPainterlyColor(float2 UV, float3 KuwaharaColor)
-{
-#if DETAIL_REINTRODUCTION_ENABLE
-    float3 Detail = 0.0;
-
-#if DETAIL_COLOR_ONLY_ENABLE
-    Detail = GetColorOnlyHighFrequencyDetail(UV);
-#else
-    Detail = GetHighFrequencyDetail(UV);
-#endif
-
-    float DetailMask = GetDetailDepthMask(UV);
-    float3 FinalColor = KuwaharaColor + Detail * (DETAIL_REINTRODUCTION_STRENGTH * DetailMask);
-    return max(FinalColor, 0.0);
-#else
-    return KuwaharaColor;
-#endif
-}
-
-//////////////////////////////////////////////////////////////
-// DEBUGS
-//////////////////////////////////////////////////////////////
-
-float3 DebugTensorDirection(float2 Direction)
-{
-    return float3(Direction * 0.5 + 0.5, 0.0);
-}
-
-float3 DebugTensorAnisotropy(float Anisotropy)
-{
-    return float3(Anisotropy.xxx);
-}
-
-float3 DebugKernelAspect(float Aspect)
-{
-    float T = saturate((Aspect - 1.0) / max(KUWAHARA_MAX_STRETCH - 1.0, 1e-5));
-    return float3(T, T, T);
-}
-
-float3 DebugTensorTrace(float Trace)
-{
-    float T = saturate(Trace * 32.0);
-    return float3(T, T, T);
-}
-
-float3 DebugDepthRadiusFactor(float T)
-{
-    return float3(T, T, T);
-}
+#include "/GilbertShaders/Private/GilbertCommon.ush"
+#include "/GilbertShaders/Private/GilbertTensor.ush"
+#include "/GilbertShaders/Private/GilbertKuwahara.ush"
 
 //////////////////////////////////////////////////////////////
 // MAIN
@@ -494,13 +53,15 @@ float4 MainPS(float2 UV : TexCoord) : SV_Target
 {
     float2 TexelSize = View.BufferSizeAndInvSize.zw;
 
-    FTensorData Tensor = AccumulateStructureTensor(UV, TexelSize);
-    FDirectionData DirectionData = SolveTensorDirectionAndAnisotropy(Tensor);
+    // New split pipeline: orientation from normals, anisotropy from scene color.
+    // See GilbertTensor.ush — ComputeDirectionData replaces the old
+    // AccumulateStructureTensor + SolveTensorDirectionAndAnisotropy two-step.
+    FDirectionData DirectionData = ComputeDirectionData(UV, TexelSize);
 
-    float KernelAspect = 1.0;
+    float KernelAspect      = 1.0;
     float DepthRadiusFactor = 0.0;
-    float3 KuwaharaColor = ApplyTensorDrivenQuadrantKuwahara(UV, DirectionData, KernelAspect, DepthRadiusFactor);
-    float3 FinalColor = ComposeFinalPainterlyColor(UV, KuwaharaColor);
+    float3 KuwaharaColor    = ApplyGeneralizedKuwahara(UV, DirectionData, KernelAspect, DepthRadiusFactor);
+    float3 FinalColor       = ComposeFinalPainterlyColor(UV, KuwaharaColor);
 
 #if DEBUG_MODE == DEBUG_TENSOR_DIRECTION
     return float4(DebugTensorDirection(DirectionData.Direction), 1.0);
@@ -517,11 +78,11 @@ float4 MainPS(float2 UV : TexCoord) : SV_Target
 #elif DEBUG_MODE == DEBUG_DEPTH_RADIUS_FACTOR
     return float4(DebugDepthRadiusFactor(DepthRadiusFactor), 1.0);
 #elif DEBUG_MODE == DEBUG_DETAIL_ONLY
-#if DETAIL_COLOR_ONLY_ENABLE
-    return float4(GetColorOnlyHighFrequencyDetail(UV) * 0.5 + 0.5, 1.0);
-#else
-    return float4(GetHighFrequencyDetail(UV) * 0.5 + 0.5, 1.0);
-#endif
+    #if DETAIL_COLOR_ONLY_ENABLE
+        return float4(GetColorOnlyHighFrequencyDetail(UV) * 0.5 + 0.5, 1.0);
+    #else
+        return float4(GetHighFrequencyDetail(UV) * 0.5 + 0.5, 1.0);
+    #endif
 #elif DEBUG_MODE == DEBUG_LOW_FREQUENCY
     return float4(GetSmallBlurredSceneColor(UV), 1.0);
 #elif DEBUG_MODE == DEBUG_DETAIL_DEPTH_MASK
