@@ -14,8 +14,14 @@ SamplerState   SceneColorSampler;
 //////////////////////////////////////////////////////////////
 
 // #define KUWAHARA_MAX_RADIUS 8
-// #define KUWAHARA_SHARPNESS 8.0
+
+// Raise sharpness toward the old shader's hard-selection look.
+// Paper default q=8. 16 gives sharper, more graphic stroke boundaries.
+// The old 4-quadrant shader used hard min-variance (effectively infinite q).
+#define KUWAHARA_SHARPNESS 16.0
+
 // #define KUWAHARA_ZERO_CROSSING 0.58
+#define TENSOR_SOURCE TENSOR_SOURCE_SCENECOLOR
 // #define TENSOR_SOURCE TENSOR_SOURCE_NORMALS   // switch back to normals
 // #define TENSOR_NORMAL_BLEND 0.5               // only used in HYBRID mode
 // #define DEPTH_RADIUS_ENABLE 1

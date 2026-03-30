@@ -10,7 +10,7 @@
 //////////////////////////////////////////////////////////////
 
 #ifndef KUWAHARA_MIN_RADIUS
-#define KUWAHARA_MIN_RADIUS 2
+#define KUWAHARA_MIN_RADIUS 4
 #endif
 #ifndef KUWAHARA_MAX_RADIUS
 #define KUWAHARA_MAX_RADIUS 8
@@ -140,9 +140,18 @@ float3 ApplyGeneralizedKuwahara(float2 UV, FDirectionData DirectionData, out flo
 {
     float2 TexelSize = View.BufferSizeAndInvSize.zw;
 
-    float TraceTrust          = saturate((DirectionData.Trace - KUWAHARA_MIN_TRACE) / max(KUWAHARA_MIN_TRACE, 1e-6));
-    float AnisoTrust          = (DirectionData.Anisotropy < KUWAHARA_MIN_ANISOTROPY) ? 0.0 : DirectionData.Anisotropy;
-    float EffectiveAnisotropy = AnisoTrust * TraceTrust;
+    // Use anisotropy directly — no TraceTrust gating.
+    //
+    // TraceTrust was comparing the smoothed color tensor trace against a
+    // threshold calibrated for normal-based tensors (~0.01+). The Gaussian-
+    // averaged color tensor has trace values ~10-100x smaller, so TraceTrust
+    // was near 0 for almost every pixel → EffectiveAnisotropy ≈ 0 → circular
+    // kernel everywhere → plain Kuwahara blur with no directional strokes.
+    //
+    // The paper doesn't use TraceTrust. A = (λ1-λ2)/(λ1+λ2) already returns
+    // 0 in flat/uniform regions naturally (both eigenvalues → 0 → A protected
+    // by TENSOR_EPSILON → 0), so no extra gating is needed.
+    float EffectiveAnisotropy = DirectionData.Anisotropy;
 
     DepthRadiusFactor = GetDepthRadiusFactor(UV);
     float Radius      = lerp((float)KUWAHARA_MIN_RADIUS, (float)KUWAHARA_MAX_RADIUS, DepthRadiusFactor);
