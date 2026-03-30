@@ -10,7 +10,7 @@
 //////////////////////////////////////////////////////////////
 
 #ifndef KUWAHARA_MIN_RADIUS
-#define KUWAHARA_MIN_RADIUS 4
+#define KUWAHARA_MIN_RADIUS 1
 #endif
 #ifndef KUWAHARA_MAX_RADIUS
 #define KUWAHARA_MAX_RADIUS 8

@@ -4,20 +4,33 @@
 
 //////////////////////////////////////////////////////////////
 // GILBERT TENSOR
-// Structure tensor, eigenvalue decomposition, direction/anisotropy.
+// Structure tensor computation, eigenvalue decomposition,
+// and direction/anisotropy solving.
 // Depends on: GilbertCommon.ush
+//////////////////////////////////////////////////////////////
+
+//////////////////////////////////////////////////////////////
+// DEFAULTS
+// Override these in your .usf before including this file.
 //////////////////////////////////////////////////////////////
 
 #ifndef TENSOR_EPSILON
 #define TENSOR_EPSILON 1e-5
 #endif
 
+// Tensor source mode — controls what ComputeDirectionData uses.
+//   SCENECOLOR : Color gradients (Gaussian-smoothed Sobel on luma).
+//                Matches paper + Acerola exactly.
+//                Anisotropy varies everywhere there's texture/color contrast.
+//   NORMALS    : World normal derivatives. Only responds to geometric curvature.
+//                Anisotropy is near-zero on flat surfaces regardless of texture.
+//   HYBRID     : Direction from normals, anisotropy from color.
 #define TENSOR_SOURCE_NORMALS    0
 #define TENSOR_SOURCE_SCENECOLOR 1
 #define TENSOR_SOURCE_HYBRID     2
 
 #ifndef TENSOR_SOURCE
-#define TENSOR_SOURCE TENSOR_SOURCE_SCENECOLOR
+#define TENSOR_SOURCE TENSOR_SOURCE_NORMALS
 #endif
 
 #ifndef TENSOR_NORMAL_BLEND
@@ -28,7 +41,38 @@
 #define ROTATE_TENSOR_DIRECTION_90 1
 #endif
 
-// How many texels to step when sampling neighbors for curvature.
+// -------------------------------------------------------
+// TENSOR BLUR (SCENECOLOR path only)
+//
+// Acerola's anisotropic shader runs the structure tensor
+// through two separate Gaussian blur compute passes before
+// eigendecomposing. Without this smoothing step:
+//   - Any single-pixel Sobel noise registers as strong anisotropy
+//   - Direction changes incoherently pixel-to-pixel
+//   - Net result looks like a plain circular blur
+//
+// We replicate this inline by accumulating the per-pixel
+// gradient tensor over a neighborhood with Gaussian weights,
+// then eigendecomposing the accumulated result.
+//
+// TENSOR_BLUR_RADIUS: neighbourhood half-size in pixels.
+//   Acerola's default _BlurRadius = 2 (5x5 neighbourhood).
+//   A value of 3 (7x7) is slightly smoother and recommended.
+//   Higher values = smoother direction fields, more samples.
+//
+// TENSOR_SIGMA: Gaussian standard deviation.
+//   Acerola uses sigma = 2.0. Keep this matched to BlurRadius.
+// -------------------------------------------------------
+#ifndef TENSOR_BLUR_RADIUS
+#define TENSOR_BLUR_RADIUS 3
+#endif
+
+#ifndef TENSOR_SIGMA
+#define TENSOR_SIGMA 2.0
+#endif
+
+// How many texels to step when sampling neighbors for the
+// normal-based curvature tensor. 2-4 is a good range.
 #ifndef TENSOR_CURVATURE_SAMPLE_RADIUS
 #define TENSOR_CURVATURE_SAMPLE_RADIUS 3.0
 #endif
@@ -39,9 +83,9 @@
 
 struct FTensorData
 {
-    float A;
-    float B;
-    float C;
+    float A; // E = fx*fx
+    float B; // F = fx*fy
+    float C; // G = fy*fy
 };
 
 struct FDirectionData
@@ -53,24 +97,27 @@ struct FDirectionData
 };
 
 //////////////////////////////////////////////////////////////
-// COMPRESSED LUMA FOR TENSOR
+// HDR-SAFE LUMA
 //
-// When computing scene-color Sobel gradients, HDR values
-// (sky, specular highlights >> 1) can dominate the gradient
-// field, pointing everything toward the brightest pixels.
-// Reinhard-compress to a perceptual [0,1] range first so
-// that all surface features contribute equally to direction.
+// The Sobel gradient must work on LDR-range values.
+// GetSceneColor returns raw HDR scene color (AfterDOF),
+// so we tonemap before computing luma — otherwise bright
+// sky/specular dominates the tensor and makes everything
+// appear strongly anisotropic.
+//
+// Matches Acerola's assumption: his buffer is already LDR.
 //////////////////////////////////////////////////////////////
 
-float GetCompressedLuma(float2 UV)
+float GetTonemappedLuma(float2 UV)
 {
-    float3 Color = GetSceneColor(UV);
-    float3 Compressed = Color / (1.0 + Color);
-    return dot(Compressed, float3(0.299, 0.587, 0.114));
+    float3 HDR  = GetSceneColor(UV);
+    float  Luma = dot(HDR, float3(0.2126, 0.7152, 0.0722));
+    float3 LDR  = HDR / (1.0 + Luma);      // Same Reinhard as FilterTonemap
+    return dot(LDR, float3(0.2126, 0.7152, 0.0722));
 }
 
 //////////////////////////////////////////////////////////////
-// TENSOR SOURCES
+// TENSOR SOURCES (per-pixel, un-smoothed)
 //////////////////////////////////////////////////////////////
 
 FTensorData ComputeTensorSampleFromNormals(float2 UV, float2 TexelSize)
@@ -89,17 +136,27 @@ FTensorData ComputeTensorSampleFromNormals(float2 UV, float2 TexelSize)
     return T;
 }
 
-// Sobel structure tensor from scene color luma.
-// Uses compressed luma so HDR highlights don't monopolize the gradients.
-// Matches Acerola's CS_StructureTensor (dot(Sx,Sx), dot(Sy,Sy), dot(Sx,Sy)).
 FTensorData ComputeTensorSampleFromSceneColor(float2 UV, float2 TexelSize)
 {
-    float SobelX[9] = { -1.0, -2.0, -1.0,  0.0, 0.0, 0.0,  1.0, 2.0, 1.0 };
-    float SobelY[9] = { -1.0,  0.0,  1.0, -2.0, 0.0, 2.0, -1.0, 0.0, 1.0 };
+    // Sobel on HDR-safe tonemapped luma — paper §3.1, matches Acerola.
+    // Layout is column-major (X outer, Y inner) to match our loop order.
+    float SobelX[9] =
+    {
+        -1.0, -2.0, -1.0,  // X=-1 column
+         0.0,  0.0,  0.0,  // X=0  column
+         1.0,  2.0,  1.0   // X=+1 column
+    };
 
-    float GradientX = 0.0;
-    float GradientY = 0.0;
-    int   Index     = 0;
+    float SobelY[9] =
+    {
+        -1.0,  0.0,  1.0,  // X=-1 column, rows Y=-1,0,+1
+        -2.0,  0.0,  2.0,  // X=0  column
+        -1.0,  0.0,  1.0   // X=+1 column
+    };
+
+    float Gx = 0.0;
+    float Gy = 0.0;
+    int   Idx = 0;
 
     [unroll]
     for (int X = -1; X <= 1; ++X)
@@ -107,202 +164,223 @@ FTensorData ComputeTensorSampleFromSceneColor(float2 UV, float2 TexelSize)
         [unroll]
         for (int Y = -1; Y <= 1; ++Y)
         {
-            float Luma = GetCompressedLuma(UV + float2(X, Y) * TexelSize);
-            GradientX += Luma * SobelX[Index];
-            GradientY += Luma * SobelY[Index];
-            Index++;
+            float L = GetTonemappedLuma(UV + float2(X, Y) * TexelSize);
+            Gx += L * SobelX[Idx];
+            Gy += L * SobelY[Idx];
+            Idx++;
         }
     }
 
     FTensorData T;
-    T.A = GradientX * GradientX;
-    T.B = GradientX * GradientY;
-    T.C = GradientY * GradientY;
+    T.A = Gx * Gx;
+    T.B = Gx * Gy;
+    T.C = Gy * Gy;
     return T;
 }
 
-FTensorData BlendTensors(FTensorData ColorTensor, FTensorData NormalTensor, float NormalBlend)
+FTensorData BlendTensors(FTensorData A, FTensorData B, float BlendToB)
 {
     FTensorData T;
-    T.A = lerp(ColorTensor.A, NormalTensor.A, NormalBlend);
-    T.B = lerp(ColorTensor.B, NormalTensor.B, NormalBlend);
-    T.C = lerp(ColorTensor.C, NormalTensor.C, NormalBlend);
+    T.A = lerp(A.A, B.A, BlendToB);
+    T.B = lerp(A.B, B.B, BlendToB);
+    T.C = lerp(A.C, B.C, BlendToB);
     return T;
 }
 
 //////////////////////////////////////////////////////////////
-// TENSOR PIPELINE
+// GAUSSIAN-SMOOTHED TENSOR (SCENECOLOR path)
 //
-// Acerola's approach: compute Sobel structure tensor from color,
-// Gaussian-blur the tensor, then eigendecompose.
+// Replicates Acerola's CS_HorizontalBlurPass + CS_CalculateAnisotropy
+// as a single inline 2D Gaussian accumulation.
 //
-// We are single-pass so we can't do a true separable Gaussian blur.
-// We approximate it by accumulating the Sobel tensor over a small
-// neighborhood (3x3 of Sobel evaluations = effectively 5x5 coverage).
-// This gives a smooth, stable direction field on textured surfaces.
+// Per sample: 4 tonemapped luma reads (central difference in X and Y).
+// Total reads: (2*R+1)^2 * 4.  With R=3: 49 * 4 = 196 luma reads.
 //
-// ComputeDirectionData dispatches based on TENSOR_SOURCE:
-//   TENSOR_SOURCE_SCENECOLOR (default) — Acerola's Sobel approach.
-//     Direction AND anisotropy both come from color gradients.
-//     Strokes vary everywhere there is texture contrast — flat ground,
-//     stone walls, sky seams — not just at hard geometry edges.
-//
-//   TENSOR_SOURCE_NORMALS — original split approach.
-//     Orientation from world-normal projection, anisotropy from
-//     normal-based curvature tensor. Good for clean geometry,
-//     but gives near-zero anisotropy on flat textured surfaces.
-//
-//   TENSOR_SOURCE_HYBRID — weighted blend of both.
+// Central difference is used per sample (cheaper than full Sobel),
+// which is fine because the Gaussian smoothing that follows is what
+// does the heavy lifting for coherent direction fields.
+//////////////////////////////////////////////////////////////
+
+FTensorData ComputeSmoothedTensorFromSceneColor(float2 UV, float2 TexelSize)
+{
+    float AccA = 0.0, AccB = 0.0, AccC = 0.0, TotalW = 0.0;
+
+    float InvTwoSigmaSq = 1.0 / (2.0 * TENSOR_SIGMA * TENSOR_SIGMA);
+
+    for (int TY = -TENSOR_BLUR_RADIUS; TY <= TENSOR_BLUR_RADIUS; TY++)
+    {
+        for (int TX = -TENSOR_BLUR_RADIUS; TX <= TENSOR_BLUR_RADIUS; TX++)
+        {
+            float2 SampleUV = UV + float2(TX, TY) * TexelSize;
+
+            // Central-difference gradient on tonemapped luma.
+            // Equivalent to Acerola's simple Sx/Sy per-pixel computation.
+            float Lx = GetTonemappedLuma(SampleUV + float2( TexelSize.x, 0.0))
+                     - GetTonemappedLuma(SampleUV + float2(-TexelSize.x, 0.0));
+            float Ly = GetTonemappedLuma(SampleUV + float2(0.0,  TexelSize.y))
+                     - GetTonemappedLuma(SampleUV + float2(0.0, -TexelSize.y));
+
+            // 2D Gaussian weight — equivalent to the separable H + V blur passes.
+            float D2 = float(TX * TX + TY * TY);
+            float W  = exp(-D2 * InvTwoSigmaSq);
+
+            AccA   += Lx * Lx * W;
+            AccB   += Lx * Ly * W;
+            AccC   += Ly * Ly * W;
+            TotalW += W;
+        }
+    }
+
+    float InvW = 1.0 / max(TotalW, 1e-8);
+
+    FTensorData T;
+    T.A = AccA * InvW;
+    T.B = AccB * InvW;
+    T.C = AccC * InvW;
+    return T;
+}
+
+//////////////////////////////////////////////////////////////
+// TENSOR SOLVER
+// Eigendecomposition → direction angle and anisotropy ratio.
+// Paper §3.1: λ1,2 = (E+G ± sqrt((E-G)^2 + 4F^2)) / 2
+//             t     = (λ1-E, -F)  (eigenvector, min rate of change)
+//             A     = (λ1-λ2) / (λ1+λ2)
 //////////////////////////////////////////////////////////////
 
 FDirectionData SolveTensorDirectionAndAnisotropy(FTensorData T)
 {
-    float A = T.A;
-    float B = T.B;
-    float C = T.C;
-
-    float Trace   = A + C;
-    float Delta   = sqrt(max((A - C) * (A - C) + 4.0 * B * B, 0.0));
-    float Lambda1 = 0.5 * (Trace + Delta);
-    float Lambda2 = 0.5 * (Trace - Delta);
-
-    // Eigenvector of the minimum-rate-of-change direction.
-    // This is the direction strokes run along (tangent to edges).
-    // Matches Acerola's: t = normalize(float2(lambda1 - E, -F))
-    float2 V = float2(Lambda1 - A, -B);
-    float2 Dir = (length(V) > 1e-6) ? normalize(V) : float2(1.0, 0.0);
-
-    // Acerola stores phi = -atan2(t.y, t.x). We match that sign convention.
-    float Phi = -atan2(Dir.y, Dir.x);
-    Dir = float2(cos(Phi), sin(Phi));
-
-#if ROTATE_TENSOR_DIRECTION_90
-    Dir = float2(-Dir.y, Dir.x);
-#endif
-
-    FDirectionData Out;
-    Out.Direction  = normalize(Dir);
-    Out.Angle      = atan2(Out.Direction.y, Out.Direction.x);
-    Out.Anisotropy = saturate((Lambda1 - Lambda2) / max(Lambda1 + Lambda2, TENSOR_EPSILON));
-    Out.Trace      = Trace;
-    return Out;
-}
-
-FDirectionData ComputeDirectionData(float2 UV, float2 TexelSize)
-{
-#if TENSOR_SOURCE == TENSOR_SOURCE_SCENECOLOR
-
-    // --- Scene color Sobel path (matches Acerola) ---
-    // Accumulate the structure tensor over a 3x3 neighborhood of Sobel
-    // evaluations, weighted by a simple box filter. This approximates
-    // Acerola's two-pass separable Gaussian blur of the tensor in a
-    // single pass, giving a smoother, less noisy direction field.
-    FTensorData Accumulated;
-    Accumulated.A = 0.0;
-    Accumulated.B = 0.0;
-    Accumulated.C = 0.0;
-
-    float TotalWeight = 0.0;
-
-    // 3x3 neighborhood of Sobel samples, Gaussian-weighted.
-    // sigma ≈ 1.0 → weights roughly: 0.077, 0.123, 0.077 / 0.123, 0.197, 0.123 / ...
-    // Simplified to 1-2-1 separable weights (integer, re-normalized).
-    float NeighborWeights[9] = { 1.0, 2.0, 1.0, 2.0, 4.0, 2.0, 1.0, 2.0, 1.0 };
-    int   WIndex = 0;
-
-    [unroll]
-    for (int NY = -1; NY <= 1; ++NY)
-    {
-        [unroll]
-        for (int NX = -1; NX <= 1; ++NX)
-        {
-            float2 NeighborUV = UV + float2(NX, NY) * TexelSize;
-            FTensorData T = ComputeTensorSampleFromSceneColor(NeighborUV, TexelSize);
-            float W = NeighborWeights[WIndex];
-
-            Accumulated.A += T.A * W;
-            Accumulated.B += T.B * W;
-            Accumulated.C += T.C * W;
-            TotalWeight   += W;
-            WIndex++;
-        }
-    }
-
-    Accumulated.A /= TotalWeight;
-    Accumulated.B /= TotalWeight;
-    Accumulated.C /= TotalWeight;
-
-    return SolveTensorDirectionAndAnisotropy(Accumulated);
-
-#elif TENSOR_SOURCE == TENSOR_SOURCE_HYBRID
-
-    FTensorData ColorTensor  = ComputeTensorSampleFromSceneColor(UV, TexelSize);
-    FTensorData NormalTensor = ComputeTensorSampleFromNormals(UV, TexelSize);
-    FTensorData Blended      = BlendTensors(ColorTensor, NormalTensor, TENSOR_NORMAL_BLEND);
-    return SolveTensorDirectionAndAnisotropy(Blended);
-
-#else // TENSOR_SOURCE_NORMALS
-
-    // Original normals-based split path.
-    float3 WorldN  = GetWorldNormal(UV);
-    float3 ViewN   = mul((float3x3)View.TranslatedWorldToView, WorldN);
-    float2 ScreenN = normalize(ViewN.xy + float2(1e-6, 1e-6));
-    float2 StrokeDir = float2(-ScreenN.y, ScreenN.x);
-
-    float2 CurvatureOffset = TexelSize * TENSOR_CURVATURE_SAMPLE_RADIUS;
-    float3 N   = GetWorldNormal(UV);
-    float3 Nx  = GetWorldNormal(UV + float2( CurvatureOffset.x, 0.0));
-    float3 Ny  = GetWorldNormal(UV + float2(0.0,  CurvatureOffset.y));
-    float3 Nxn = GetWorldNormal(UV - float2( CurvatureOffset.x, 0.0));
-    float3 Nyn = GetWorldNormal(UV - float2(0.0,  CurvatureOffset.y));
-
-    float3 dNdx = (Nx - Nxn) * 0.5;
-    float3 dNdy = (Ny - Nyn) * 0.5;
-
-    float E = dot(dNdx, dNdx);
-    float F = dot(dNdx, dNdy);
-    float G = dot(dNdy, dNdy);
+    float E = T.A;
+    float F = T.B;
+    float G = T.C;
 
     float Trace   = E + G;
     float Delta   = sqrt(max((E - G) * (E - G) + 4.0 * F * F, 0.0));
     float Lambda1 = 0.5 * (Trace + Delta);
     float Lambda2 = 0.5 * (Trace - Delta);
-    float Anisotropy = saturate((Lambda1 - Lambda2) / max(Lambda1 + Lambda2, TENSOR_EPSILON));
+
+    // Eigenvector of minimum eigenvalue = direction of minimum change = along edges.
+    // Matches Acerola: float2 v = float2(lambda1 - g.x, -g.z) where g.x=E, g.z=F.
+    float2 V   = float2(Lambda1 - E, -F);
+    float2 Dir = (length(V) > 1e-6) ? normalize(V) : float2(0.0, 1.0);
+
+    // Rotate 90° so the kernel stretches ALONG the flow direction,
+    // matching Acerola's phi convention: phi = -atan2(t.y, t.x).
+#if ROTATE_TENSOR_DIRECTION_90
+    Dir = float2(-Dir.y, Dir.x);
+#endif
+
+    FDirectionData Out;
+    Out.Direction  = Dir;
+    Out.Angle      = atan2(Dir.y, Dir.x);
+    Out.Anisotropy = saturate((Lambda1 - Lambda2) / max(Lambda1 + Lambda2, TENSOR_EPSILON));
+    Out.Trace      = Trace;
+    return Out;
+}
+
+//////////////////////////////////////////////////////////////
+// TENSOR PIPELINE — single entry point for the Kuwahara pass.
+// Branches on TENSOR_SOURCE so .usf overrides take effect.
+//////////////////////////////////////////////////////////////
+
+FDirectionData ComputeDirectionData(float2 UV, float2 TexelSize)
+{
+#if TENSOR_SOURCE == TENSOR_SOURCE_SCENECOLOR
+    // -----------------------------------------------------------
+    // Pure scene colour path.
+    // Gaussian-smoothed structure tensor from colour gradients.
+    // Matches paper §3.1 and Acerola's multi-pass pipeline exactly.
+    //
+    // The Gaussian smoothing is critical:
+    //   Without it → noisy direction field → looks like plain blur.
+    //   With it    → coherent directional strokes + correct anisotropy.
+    // -----------------------------------------------------------
+    FTensorData T = ComputeSmoothedTensorFromSceneColor(UV, TexelSize);
+    return SolveTensorDirectionAndAnisotropy(T);
+
+#elif TENSOR_SOURCE == TENSOR_SOURCE_HYBRID
+    // -----------------------------------------------------------
+    // Hybrid path.
+    // Direction from view-space normal (stable, geometry-driven).
+    // Anisotropy from smoothed colour tensor (texture-responsive).
+    // -----------------------------------------------------------
+    float3 WorldN    = GetWorldNormal(UV);
+    float3 ViewN     = mul((float3x3)View.TranslatedWorldToView, WorldN);
+    float2 ScreenN   = normalize(ViewN.xy + float2(1e-6, 1e-6));
+    float2 StrokeDir = float2(-ScreenN.y, ScreenN.x);
+
+    FTensorData T = ComputeSmoothedTensorFromSceneColor(UV, TexelSize);
+
+    float E = T.A; float F_ = T.B; float G = T.C;
+    float Trace   = E + G;
+    float Delta   = sqrt(max((E - G) * (E - G) + 4.0 * F_ * F_, 0.0));
+    float Lambda1 = 0.5 * (Trace + Delta);
+    float Lambda2 = 0.5 * (Trace - Delta);
 
     FDirectionData Out;
     Out.Direction  = normalize(StrokeDir);
     Out.Angle      = atan2(Out.Direction.y, Out.Direction.x);
-    Out.Anisotropy = Anisotropy;
+    Out.Anisotropy = saturate((Lambda1 - Lambda2) / max(Lambda1 + Lambda2, TENSOR_EPSILON));
     Out.Trace      = Trace;
     return Out;
 
+#else
+    // -----------------------------------------------------------
+    // Normal-based split pipeline (TENSOR_SOURCE_NORMALS, default).
+    // No Gaussian smoothing needed — GBuffer normals are already
+    // smooth (interpolated across triangles before storage).
+    // -----------------------------------------------------------
+    float3 WorldN    = GetWorldNormal(UV);
+    float3 ViewN     = mul((float3x3)View.TranslatedWorldToView, WorldN);
+    float2 ScreenN   = normalize(ViewN.xy + float2(1e-6, 1e-6));
+    float2 StrokeDir = float2(-ScreenN.y, ScreenN.x);
+
+    float2 CurvOffset = TexelSize * TENSOR_CURVATURE_SAMPLE_RADIUS;
+    float3 Nx  = GetWorldNormal(UV + float2( CurvOffset.x,  0.0));
+    float3 Nxn = GetWorldNormal(UV + float2(-CurvOffset.x,  0.0));
+    float3 Ny  = GetWorldNormal(UV + float2( 0.0,  CurvOffset.y));
+    float3 Nyn = GetWorldNormal(UV + float2( 0.0, -CurvOffset.y));
+
+    float3 dNdx = (Nx - Nxn) * 0.5;
+    float3 dNdy = (Ny - Nyn) * 0.5;
+
+    float E = dot(dNdx, dNdx);
+    float F_ = dot(dNdx, dNdy);
+    float G = dot(dNdy, dNdy);
+
+    float Trace   = E + G;
+    float Delta   = sqrt(max((E - G) * (E - G) + 4.0 * F_ * F_, 0.0));
+    float Lambda1 = 0.5 * (Trace + Delta);
+    float Lambda2 = 0.5 * (Trace - Delta);
+
+    FDirectionData Out;
+    Out.Direction  = normalize(StrokeDir);
+    Out.Angle      = atan2(Out.Direction.y, Out.Direction.x);
+    Out.Anisotropy = saturate((Lambda1 - Lambda2) / max(Lambda1 + Lambda2, TENSOR_EPSILON));
+    Out.Trace      = Trace;
+    return Out;
 #endif
 }
 
-// Legacy compatibility wrappers.
+// Legacy — wraps the un-smoothed per-pixel version for backwards compat.
 FTensorData AccumulateStructureTensor(float2 UV, float2 TexelSize)
 {
     return ComputeTensorSampleFromSceneColor(UV, TexelSize);
 }
 
-FDirectionData SolveTensorDirectionAndAnisotropy_Legacy(FTensorData T)
-{
-    return SolveTensorDirectionAndAnisotropy(T);
-}
-
 //////////////////////////////////////////////////////////////
-// TENSOR DEBUG
+// TENSOR DEBUG VISUALIZERS
 //////////////////////////////////////////////////////////////
 
 float3 DebugTensorSourcePreview(float2 UV)
 {
 #if TENSOR_SOURCE == TENSOR_SOURCE_SCENECOLOR
-    float Luma = GetCompressedLuma(UV);
-    return float3(Luma, Luma, Luma);
+    float L = GetTonemappedLuma(UV);
+    return float3(L, L, L);
 #elif TENSOR_SOURCE == TENSOR_SOURCE_HYBRID
     float3 N = GetWorldNormal(UV) * 0.5 + 0.5;
-    float  Luma = GetCompressedLuma(UV);
-    return lerp(float3(Luma, Luma, Luma), N, TENSOR_NORMAL_BLEND);
+    float  L = GetTonemappedLuma(UV);
+    return lerp(float3(L, L, L), N, TENSOR_NORMAL_BLEND);
 #else
     return GetWorldNormal(UV) * 0.5 + 0.5;
 #endif
@@ -315,11 +393,13 @@ float3 DebugTensorDirection(float2 Direction)
 
 float3 DebugTensorAnisotropy(float Anisotropy)
 {
-    return float3(Anisotropy.xxx);
+    return Anisotropy.xxx;
 }
 
 float3 DebugTensorTrace(float Trace)
 {
-    float T = saturate(Trace * 32.0);
+    // Scale tuned for the smoothed tensor — the accumulated Gaussian
+    // trace is much smaller than a raw single-pixel Sobel trace.
+    float T = saturate(Trace * 200.0);
     return float3(T, T, T);
 }
