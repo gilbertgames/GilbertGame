@@ -1,42 +1,28 @@
 #include "/Engine/Public/Platform.ush"
 #include "/Engine/Private/Common.ush"
 
-//////////////////////////////////////////////////////////////
-// HLSL GLOBAL DECLARATIONS
-//
-// SHADER_PARAMETER_RDG_TEXTURE and SHADER_PARAMETER_SAMPLER in
-// FGilbertPainterlyPS::FParameters handle the C++ binding and
-// GPU resource lifetime, but they do NOT auto-generate HLSL
-// globals. We must declare them here explicitly so that
-// GilbertCommon.ush (and anything it transitively includes)
-// can reference them by name.
-//
-// These must come BEFORE the .ush includes below.
-// SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureShaderParameters, SceneTextures)
-// is the exception — that macro DOES auto-generate its HLSL block
-// (SceneTexturesStruct), which is why GetWorldNormal() already works.
-//////////////////////////////////////////////////////////////
-
+// HLSL globals — declared here so GilbertCommon.ush can use them.
+// SHADER_PARAMETER_RDG_TEXTURE / SHADER_PARAMETER_SAMPLER handle C++
+// binding but do NOT auto-generate HLSL globals (unlike
+// SHADER_PARAMETER_STRUCT_INCLUDE which does generate SceneTexturesStruct).
 Texture2D      SceneColorTexture;
 SamplerState   SceneColorSampler;
 
 //////////////////////////////////////////////////////////////
 // CONFIG OVERRIDES
-// Defaults live in each .ush file. Only specify values here
-// that you want to deviate from those defaults.
+// Defaults live in each .ush file.
 //////////////////////////////////////////////////////////////
 
-// -- Uncomment and set any overrides below --
 // #define KUWAHARA_MAX_RADIUS 8
-// #define TENSOR_SOURCE TENSOR_SOURCE_SCENECOLOR
-// #define TENSOR_NORMAL_BLEND 0.5
-// #define DEPTH_RADIUS_ENABLE 0
-// #define DETAIL_REINTRODUCTION_ENABLE 0
+// #define KUWAHARA_SHARPNESS 8.0
+// #define KUWAHARA_ZERO_CROSSING 0.58
+// #define TENSOR_SOURCE TENSOR_SOURCE_NORMALS   // switch back to normals
+// #define TENSOR_NORMAL_BLEND 0.5               // only used in HYBRID mode
+// #define DEPTH_RADIUS_ENABLE 1
+// #define DETAIL_REINTRODUCTION_ENABLE 1
 
 //////////////////////////////////////////////////////////////
 // DEBUG MODE
-// These stay here since they are only relevant to the
-// entry point, not the helper libraries.
 //////////////////////////////////////////////////////////////
 
 #define DEBUG_FINAL_OUTPUT          0
@@ -52,12 +38,10 @@ SamplerState   SceneColorSampler;
 #define DEBUG_DETAIL_DEPTH_MASK     10
 #define DEBUG_COLOR_ONLY_DETAIL     11
 
-#define DEBUG_MODE DEBUG_FINAL_OUTPUT
+#define DEBUG_MODE DEBUG_TENSOR_ANISOTROPY
 
 //////////////////////////////////////////////////////////////
-// INCLUDES
-// Any overrides above must come before these includes so the
-// .ush defaults are skipped where overridden via #ifndef.
+// INCLUDES (after any #define overrides)
 //////////////////////////////////////////////////////////////
 
 #include "/GilbertShaders/Private/GilbertCommon.ush"

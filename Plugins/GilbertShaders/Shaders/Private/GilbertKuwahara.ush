@@ -5,119 +5,92 @@
 
 //////////////////////////////////////////////////////////////
 // GILBERT KUWAHARA
-// Tensor-driven anisotropic generalized Kuwahara filter,
-// detail reintroduction, and final composite.
-// Depends on: GilbertCommon.ush, GilbertTensor.ush
-//
-// Math follows Acerola's proven implementation of:
-//   "Anisotropic Kuwahara Filtering" — Kyprianidis et al. 2009
-// Plumbing (RDG, SVE, shader structs) follows the
-//   Advanced Graphics Programming series by William Mishra-Manning.
-//////////////////////////////////////////////////////////////
-
-//////////////////////////////////////////////////////////////
-// DEFAULTS
-// Override these in your .usf before including this file.
+// Math: Acerola's proven implementation of Kyprianidis et al. 2009
+// Plumbing: Advanced Graphics Programming (Mishra-Manning)
 //////////////////////////////////////////////////////////////
 
 #ifndef KUWAHARA_MIN_RADIUS
 #define KUWAHARA_MIN_RADIUS 4
 #endif
-
 #ifndef KUWAHARA_MAX_RADIUS
 #define KUWAHARA_MAX_RADIUS 8
 #endif
-
-// Maximum stretch factor for the ellipse kernel.
-// Caps how elongated the kernel can become in anisotropic regions.
 #ifndef KUWAHARA_MAX_STRETCH
 #define KUWAHARA_MAX_STRETCH 5.0
 #endif
-
-// Minimum anisotropy below which we fall back to a circle kernel.
 #ifndef KUWAHARA_MIN_ANISOTROPY
 #define KUWAHARA_MIN_ANISOTROPY 0.01
 #endif
-
-// Minimum tensor trace below which direction data is untrusted.
-// Prevents garbage orientation on featureless flat areas.
 #ifndef KUWAHARA_MIN_TRACE
 #define KUWAHARA_MIN_TRACE 0.0005
 #endif
-
-// Alpha tuning parameter from paper §3.2.
-// Controls the maximum eccentricity of the ellipse kernel.
-// Alpha = 1 gives max eccentricity of 4, matching the paper's examples.
-// As Alpha → ∞, the kernel converges to a circle.
+// Alpha = 1 gives max eccentricity of 4 (paper §3.2 examples).
 #ifndef KUWAHARA_ALPHA
 #define KUWAHARA_ALPHA 1.0
 #endif
-
-// Controls how much adjacent sectors overlap.
-// Equivalent to Acerola's _ZeroCrossing parameter.
-// Range: ~0.4 (sharp) to ~1.0 (soft/washy). Paper uses ~0.58.
+// Sector overlap. ~0.4 sharp, ~1.0 soft. Paper uses ~0.58.
 #ifndef KUWAHARA_ZERO_CROSSING
 #define KUWAHARA_ZERO_CROSSING 0.58
 #endif
-
-// Sharpness of the stroke segmentation — the q exponent from the paper.
-// Higher = harder, more graphic/painted edges between color regions.
-// Lower  = softer, more watercolor-like transitions.
-// Paper uses q = 8. Acerola's _Q parameter maps to this directly.
+// q exponent from paper §3.2. 8 = hard edges, lower = watercolor.
 #ifndef KUWAHARA_SHARPNESS
 #define KUWAHARA_SHARPNESS 8.0
 #endif
-
-// Detail reintroduction — adds back high-frequency detail on top of
-// the Kuwahara output to preserve texture and surface interest.
 #ifndef DETAIL_REINTRODUCTION_ENABLE
 #define DETAIL_REINTRODUCTION_ENABLE 0
 #endif
-
 #ifndef DETAIL_REINTRODUCTION_STRENGTH
 #define DETAIL_REINTRODUCTION_STRENGTH 0.5
 #endif
-
-// Depth-based falloff for detail reintroduction (fades detail far away).
 #ifndef DETAIL_DEPTH_FALLOFF_ENABLE
 #define DETAIL_DEPTH_FALLOFF_ENABLE 0
 #endif
-
 #ifndef DETAIL_DEPTH_FALLOFF_MIN
 #define DETAIL_DEPTH_FALLOFF_MIN 0.1
 #endif
-
 #ifndef DETAIL_DEPTH_FALLOFF_MAX
 #define DETAIL_DEPTH_FALLOFF_MAX 0.8
 #endif
-
-// If enabled, reintroduce only color (chroma) detail, not luma detail.
-// Preserves painted flatness in luminance while recovering color richness.
 #ifndef DETAIL_COLOR_ONLY_ENABLE
 #define DETAIL_COLOR_ONLY_ENABLE 0
 #endif
 
 //////////////////////////////////////////////////////////////
+// HDR TONE MAPPING HELPERS
+//
+// Acerola's shader runs on FF14's already-tone-mapped LDR buffer.
+// Our pass runs AfterDOF where sky/specular values can be >> 1.
+//
+// HDR breaks variance: sky (4.2, 3.8, 5.1) → huge sigma2 even in
+// a uniform patch → 1000 * sigma2 overflows pow → all alpha_i = 0
+// → Output = 0/0 → BLACK.
+//
+// Fix: per-channel Reinhard compress [0,+inf) → [0,1) before
+// accumulation. Invert back to HDR after blending.
+// Keeps variance in the same range Acerola's 1000x scale expects.
+//////////////////////////////////////////////////////////////
+
+float3 KuwaharaTonemapIn(float3 Color)
+{
+    return Color / (1.0 + Color);
+}
+
+float3 KuwaharaTonemapOut(float3 Color)
+{
+    return Color / max(1.0 - Color, 1e-4);
+}
+
+//////////////////////////////////////////////////////////////
 // DETAIL HELPERS
 //////////////////////////////////////////////////////////////
 
-// Small 3x3 Gaussian blur used to separate low vs high frequency.
 float3 GetSmallBlurredSceneColor(float2 UV)
 {
     float2 TexelSize = View.BufferSizeAndInvSize.zw;
-
-    // 3x3 Gaussian kernel weights (unnormalized).
-    float Weights[9] =
-    {
-        1.0, 2.0, 1.0,
-        2.0, 4.0, 2.0,
-        1.0, 2.0, 1.0
-    };
-
+    float Weights[9] = { 1.0, 2.0, 1.0, 2.0, 4.0, 2.0, 1.0, 2.0, 1.0 };
     float3 Sum = 0.0;
     float  WeightSum = 0.0;
     int    Index = 0;
-
     [unroll]
     for (int Y = -1; Y <= 1; ++Y)
     {
@@ -130,26 +103,20 @@ float3 GetSmallBlurredSceneColor(float2 UV)
             Index++;
         }
     }
-
     return Sum * SafeRcp(WeightSum);
 }
 
-// Full-signal high-frequency detail (luma + chroma).
 float3 GetHighFrequencyDetail(float2 UV)
 {
     return GetSceneColor(UV) - GetSmallBlurredSceneColor(UV);
 }
 
-// Chroma-only high-frequency detail (strips luma delta).
 float3 GetColorOnlyHighFrequencyDetail(float2 UV)
 {
     float3 Source       = GetSceneColor(UV);
     float3 LowFrequency = GetSmallBlurredSceneColor(UV);
-
     float SourceLuma = dot(Source,       float3(0.299, 0.587, 0.114));
     float LowLuma    = dot(LowFrequency, float3(0.299, 0.587, 0.114));
-
-    // Chroma = color - luma. Return the chroma difference.
     return (Source - SourceLuma.xxx) - (LowFrequency - LowLuma.xxx);
 }
 
@@ -164,46 +131,7 @@ float GetDetailDepthMask(float2 UV)
 }
 
 //////////////////////////////////////////////////////////////
-// KUWAHARA CORE — Anisotropic Generalized Sector Kuwahara
-//
-// Full pipeline:
-//
-//  1. Compute effective anisotropy from the tensor direction data.
-//     Gate it by trace trust so flat featureless areas don't hallucinate.
-//
-//  2. Derive ellipse semi-axes a (major) and b (minor) from anisotropy.
-//     Mirrors Acerola's implementation of the paper's S matrix (§3.2):
-//       a = radius * (alpha + A) / alpha  →  stretches along strokes
-//       b = radius * alpha / (alpha + A)  →  compresses across strokes
-//
-//  3. Build the combined scale-rotate matrix SR = S * R_phi.
-//     SR maps integer pixel offsets into normalized ellipse disc space
-//     where the ellipse boundary maps to the unit circle of radius 0.5.
-//
-//  4. Compute bounding box of the oriented ellipse in pixel space.
-//     Only iterate pixels that can possibly fall inside the ellipse.
-//
-//  5. For each sample inside the ellipse:
-//       a. Transform offset to disc space v = SR * offset.
-//       b. Compute polynomial sector weights per Acerola's zero-crossing
-//          formulation — 4 cardinal sectors, 4 diagonal sectors.
-//          This is the key difference from a naive cosine lobe: weights
-//          actually reach zero at sector midpoints, preventing bleeding.
-//       c. Accumulate weighted mean (m) and mean-of-squares (s) per sector.
-//
-//  6. Finalize each sector:
-//       mean_i   = m_i / weight_sum_i
-//       var_i    = (s_i / weight_sum_i) - mean_i^2
-//       sigma2_i = var_i.r + var_i.g + var_i.b
-//
-//  7. Compute per-sector blend weights (paper §3.2 eq. 4):
-//       alpha_i = 1 / (1 + (1000 * sigma2_i)^(q/2))
-//     The 1000x scale is CRITICAL. Colors are in [0,1], so raw
-//     sigma2 values are tiny (< 0.01). Without this scale, every
-//     alpha_i → 1, all sectors contribute equally, and you get a
-//     plain blurry average instead of a painterly stroke effect.
-//
-//  8. Output = sum(alpha_i * mean_i) / sum(alpha_i).
+// KUWAHARA CORE
 //////////////////////////////////////////////////////////////
 
 #define KUWAHARA_SECTOR_COUNT 8
@@ -212,39 +140,22 @@ float3 ApplyGeneralizedKuwahara(float2 UV, FDirectionData DirectionData, out flo
 {
     float2 TexelSize = View.BufferSizeAndInvSize.zw;
 
-    // -------------------------------------------------------
-    // Step 1: Effective anisotropy.
-    // Trace trust prevents direction noise on flat surfaces.
-    // -------------------------------------------------------
     float TraceTrust          = saturate((DirectionData.Trace - KUWAHARA_MIN_TRACE) / max(KUWAHARA_MIN_TRACE, 1e-6));
     float AnisoTrust          = (DirectionData.Anisotropy < KUWAHARA_MIN_ANISOTROPY) ? 0.0 : DirectionData.Anisotropy;
     float EffectiveAnisotropy = AnisoTrust * TraceTrust;
 
-    // -------------------------------------------------------
-    // Step 2: Depth-based radius, then ellipse semi-axes.
-    // Mirrors Acerola's a/b derivation directly.
-    // -------------------------------------------------------
     DepthRadiusFactor = GetDepthRadiusFactor(UV);
     float Radius      = lerp((float)KUWAHARA_MIN_RADIUS, (float)KUWAHARA_MAX_RADIUS, DepthRadiusFactor);
 
     float Alpha = KUWAHARA_ALPHA;
     float A     = EffectiveAnisotropy;
 
-    // Paper §3.2: S = [[alpha/(alpha+A), 0], [0, (alpha+A)/alpha]]
-    // a = major semi-axis (along strokes), b = minor (across strokes).
-    float a = Radius * clamp((Alpha + A) / max(Alpha,        1e-6), 0.1, (float)KUWAHARA_MAX_STRETCH);
-    float b = Radius * clamp( Alpha      / max(Alpha + A,    1e-6), 0.1, (float)KUWAHARA_MAX_STRETCH);
+    // Semi-axes: a = major (along strokes), b = minor (across strokes)
+    float a = Radius * clamp((Alpha + A) / max(Alpha,     1e-6), 0.1, (float)KUWAHARA_MAX_STRETCH);
+    float b = Radius * clamp( Alpha      / max(Alpha + A, 1e-6), 0.1, (float)KUWAHARA_MAX_STRETCH);
 
     KernelAspect = a * SafeRcp(max(b, 1.0));
 
-    // -------------------------------------------------------
-    // Step 3: SR matrix = S * R_phi.
-    // Maps pixel offsets to normalized disc space.
-    // Matches Acerola's mul(S, R) then mul(SR, offset) pattern.
-    // In HLSL mul(float2x2, float2) treats the vector as a column.
-    //   v.x = (X * cos - Y * sin) * 0.5 / a
-    //   v.y = (X * sin + Y * cos) * 0.5 / b
-    // -------------------------------------------------------
     float Phi    = DirectionData.Angle;
     float CosPhi = cos(Phi);
     float SinPhi = sin(Phi);
@@ -254,30 +165,16 @@ float3 ApplyGeneralizedKuwahara(float2 UV, FDirectionData DirectionData, out flo
         (0.5 / b) *  SinPhi,  (0.5 / b) *  CosPhi
     );
 
-    // -------------------------------------------------------
-    // Step 4: Oriented ellipse bounding box.
-    // Acerola's formula: project ellipse axes onto screen axes.
-    // -------------------------------------------------------
     int MaxX = (int)sqrt(a * a * CosPhi * CosPhi + b * b * SinPhi * SinPhi);
     int MaxY = (int)sqrt(a * a * SinPhi * SinPhi + b * b * CosPhi * CosPhi);
 
-    // -------------------------------------------------------
-    // Sector weight precomputation (Acerola's zero-crossing params).
-    // zeta and eta define the shape of the polynomial weighting function.
-    // -------------------------------------------------------
     float Zeta  = 2.0 / Radius;
     float ZC    = KUWAHARA_ZERO_CROSSING;
     float SinZC = sin(ZC);
     float Eta   = (Zeta + cos(ZC)) / max(SinZC * SinZC, 1e-6);
 
-    // -------------------------------------------------------
-    // Step 5: Per-sector accumulators.
-    // m[k]: float4 — xyz = weighted color sum, w = weight sum.
-    // s[k]: float3 — weighted color-squared sum (for variance).
-    // -------------------------------------------------------
     float4 m[KUWAHARA_SECTOR_COUNT];
     float3 s[KUWAHARA_SECTOR_COUNT];
-
     [unroll]
     for (int k = 0; k < KUWAHARA_SECTOR_COUNT; k++)
     {
@@ -285,56 +182,36 @@ float3 ApplyGeneralizedKuwahara(float2 UV, FDirectionData DirectionData, out flo
         s[k] = float3(0, 0, 0);
     }
 
-    // -------------------------------------------------------
-    // Step 5 (cont): Main sampling loop.
-    // -------------------------------------------------------
     for (int Y = -MaxY; Y <= MaxY; ++Y)
     {
         for (int X = -MaxX; X <= MaxX; ++X)
         {
-            // Map offset to normalized ellipse disc space.
-            // |V| <= 0.5 means the sample is inside the ellipse.
             float2 V = mul(SR, float2(X, Y));
-
             if (dot(V, V) > 0.25)
                 continue;
 
-            float3 C = GetSceneColor(UV + float2(X, Y) * TexelSize);
+            // Tone-map to [0,1] BEFORE variance computation.
+            // Fixes black sky: HDR values blow up sigma2 without this.
+            float3 C = KuwaharaTonemapIn(GetSceneColor(UV + float2(X, Y) * TexelSize));
 
-            // ---------------------------------------------------
-            // Polynomial sector weights — Acerola's formulation.
-            //
-            // 8 sectors: 4 cardinal (0°, 90°, 180°, 270°)
-            //          + 4 diagonal (45°, 135°, 225°, 315°).
-            //
-            // The polynomial z = max(0, axis_proj + cross_term)
-            // peaks at the sector center and smoothly falls to
-            // zero at the boundary, overlapping slightly with
-            // adjacent sectors (controlled by ZeroCrossing).
-            //
-            // w[k] = z^2 for extra smoothness (C1 continuous).
-            // ---------------------------------------------------
             float W[KUWAHARA_SECTOR_COUNT];
-
             float Vxx = Zeta - Eta * V.x * V.x;
             float Vyy = Zeta - Eta * V.y * V.y;
             float z;
 
-            // Cardinal axis sectors (0, 2, 4, 6):
-            z = max(0.0,  V.y + Vxx); W[0] = z * z;   // top    ( 90°)
-            z = max(0.0, -V.x + Vyy); W[2] = z * z;   // right  (  0°)
-            z = max(0.0, -V.y + Vxx); W[4] = z * z;   // bottom (270°)
-            z = max(0.0,  V.x + Vyy); W[6] = z * z;   // left   (180°)
+            z = max(0.0,  V.y + Vxx); W[0] = z * z;
+            z = max(0.0, -V.x + Vyy); W[2] = z * z;
+            z = max(0.0, -V.y + Vxx); W[4] = z * z;
+            z = max(0.0,  V.x + Vyy); W[6] = z * z;
 
-            // Diagonal axis sectors — rotate V by 45°:
             float2 VD   = (sqrt(2.0) * 0.5) * float2(V.x - V.y, V.x + V.y);
             float  VDxx = Zeta - Eta * VD.x * VD.x;
             float  VDyy = Zeta - Eta * VD.y * VD.y;
 
-            z = max(0.0,  VD.y + VDxx); W[1] = z * z; // top-right   ( 45°)
-            z = max(0.0, -VD.x + VDyy); W[3] = z * z; // bot-right   (315°)
-            z = max(0.0, -VD.y + VDxx); W[5] = z * z; // bot-left    (225°)
-            z = max(0.0,  VD.x + VDyy); W[7] = z * z; // top-left    (135°)
+            z = max(0.0,  VD.y + VDxx); W[1] = z * z;
+            z = max(0.0, -VD.x + VDyy); W[3] = z * z;
+            z = max(0.0, -VD.y + VDxx); W[5] = z * z;
+            z = max(0.0,  VD.x + VDyy); W[7] = z * z;
 
             [unroll]
             for (int k = 0; k < KUWAHARA_SECTOR_COUNT; k++)
@@ -345,35 +222,22 @@ float3 ApplyGeneralizedKuwahara(float2 UV, FDirectionData DirectionData, out flo
         }
     }
 
-    // -------------------------------------------------------
-    // Steps 6–8: Finalize mean/variance, compute alpha weights,
-    // blend sectors into final output color.
-    // -------------------------------------------------------
     float4 Output = float4(0, 0, 0, 0);
-
     [unroll]
     for (int k = 0; k < KUWAHARA_SECTOR_COUNT; k++)
     {
-        float  InvW    = SafeRcp(max(m[k].w, 1e-6));
-        float3 Mean    = m[k].rgb * InvW;
-
-        // Variance per channel: E[x^2] - E[x]^2
+        float  InvW     = SafeRcp(max(m[k].w, 1e-6));
+        float3 Mean     = m[k].rgb * InvW;
         float3 Variance = abs(s[k] * InvW - Mean * Mean);
         float  Sigma2   = Variance.r + Variance.g + Variance.b;
-
-        // Paper §3.2: alpha_i = 1 / (1 + ||s_i||^q)
-        // The 1000x scale is from Acerola — compensates for colors being
-        // in [0,1] rather than [0,255]. Without it, Sigma2 is so small
-        // that all alpha_i → 1, producing a plain weighted average.
+        // 1000x from Acerola: compensates for [0,1] colors → tiny raw sigma2.
         float Alpha_i = SafeRcp(1.0 + pow(abs(1000.0 * Sigma2), 0.5 * KUWAHARA_SHARPNESS));
-
         Output += float4(Mean * Alpha_i, Alpha_i);
     }
 
-    // Normalize and return. No passthrough lerp — the Kuwahara output
-    // IS the scene color; blending toward passthrough was suppressing
-    // the effect on flat/isotropic surfaces where it's needed most.
-    return Output.rgb * SafeRcp(max(Output.w, 1e-6));
+    float3 BlendedToneMapped = Output.rgb * SafeRcp(max(Output.w, 1e-6));
+    // Restore HDR range for the rest of the post-process pipeline.
+    return KuwaharaTonemapOut(BlendedToneMapped);
 }
 
 //////////////////////////////////////////////////////////////
@@ -384,13 +248,11 @@ float3 ComposeFinalPainterlyColor(float2 UV, float3 KuwaharaColor)
 {
 #if DETAIL_REINTRODUCTION_ENABLE
     float3 Detail = 0.0;
-
-#if DETAIL_COLOR_ONLY_ENABLE
-    Detail = GetColorOnlyHighFrequencyDetail(UV);
-#else
-    Detail = GetHighFrequencyDetail(UV);
-#endif
-
+    #if DETAIL_COLOR_ONLY_ENABLE
+        Detail = GetColorOnlyHighFrequencyDetail(UV);
+    #else
+        Detail = GetHighFrequencyDetail(UV);
+    #endif
     float DetailMask = GetDetailDepthMask(UV);
     return max(KuwaharaColor + Detail * (DETAIL_REINTRODUCTION_STRENGTH * DetailMask), 0.0);
 #else
@@ -399,17 +261,15 @@ float3 ComposeFinalPainterlyColor(float2 UV, float3 KuwaharaColor)
 }
 
 //////////////////////////////////////////////////////////////
-// KUWAHARA DEBUG VISUALIZERS
+// DEBUG
 //////////////////////////////////////////////////////////////
 
-// White = maximum stretch, black = circle kernel.
 float3 DebugKernelAspect(float Aspect)
 {
     float T = saturate((Aspect - 1.0) / max((float)KUWAHARA_MAX_STRETCH - 1.0, 1e-5));
     return float3(T, T, T);
 }
 
-// White = far (large kernel), black = near (small kernel).
 float3 DebugDepthRadiusFactor(float T)
 {
     return float3(T, T, T);
