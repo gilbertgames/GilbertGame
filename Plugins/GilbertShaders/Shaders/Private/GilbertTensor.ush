@@ -30,7 +30,7 @@
 #define TENSOR_SOURCE_HYBRID     2
 
 #ifndef TENSOR_SOURCE
-#define TENSOR_SOURCE TENSOR_SOURCE_NORMALS
+#define TENSOR_SOURCE TENSOR_SOURCE_SCENECOLOR
 #endif
 
 #ifndef TENSOR_NORMAL_BLEND
@@ -38,7 +38,7 @@
 #endif
 
 #ifndef ROTATE_TENSOR_DIRECTION_90
-#define ROTATE_TENSOR_DIRECTION_90 1
+#define ROTATE_TENSOR_DIRECTION_90 0
 #endif
 
 // -------------------------------------------------------

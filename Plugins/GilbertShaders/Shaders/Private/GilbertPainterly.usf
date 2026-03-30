@@ -38,7 +38,7 @@ SamplerState   SceneColorSampler;
 #define DEBUG_DETAIL_DEPTH_MASK     10
 #define DEBUG_COLOR_ONLY_DETAIL     11
 
-#define DEBUG_MODE DEBUG_FINAL_OUTPUT
+#define DEBUG_MODE DEBUG_PASSTHROUGH
 
 //////////////////////////////////////////////////////////////
 // INCLUDES (after any #define overrides)
