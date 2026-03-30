@@ -2,6 +2,25 @@
 #include "/Engine/Private/Common.ush"
 
 //////////////////////////////////////////////////////////////
+// HLSL GLOBAL DECLARATIONS
+//
+// SHADER_PARAMETER_RDG_TEXTURE and SHADER_PARAMETER_SAMPLER in
+// FGilbertPainterlyPS::FParameters handle the C++ binding and
+// GPU resource lifetime, but they do NOT auto-generate HLSL
+// globals. We must declare them here explicitly so that
+// GilbertCommon.ush (and anything it transitively includes)
+// can reference them by name.
+//
+// These must come BEFORE the .ush includes below.
+// SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureShaderParameters, SceneTextures)
+// is the exception — that macro DOES auto-generate its HLSL block
+// (SceneTexturesStruct), which is why GetWorldNormal() already works.
+//////////////////////////////////////////////////////////////
+
+Texture2D      SceneColorTexture;
+SamplerState   SceneColorSampler;
+
+//////////////////////////////////////////////////////////////
 // CONFIG OVERRIDES
 // Defaults live in each .ush file. Only specify values here
 // that you want to deviate from those defaults.
@@ -20,18 +39,18 @@
 // entry point, not the helper libraries.
 //////////////////////////////////////////////////////////////
 
-#define DEBUG_FINAL_OUTPUT        0
-#define DEBUG_TENSOR_DIRECTION    1
-#define DEBUG_TENSOR_ANISOTROPY   2
-#define DEBUG_KERNEL_ASPECT       3
+#define DEBUG_FINAL_OUTPUT          0
+#define DEBUG_TENSOR_DIRECTION      1
+#define DEBUG_TENSOR_ANISOTROPY     2
+#define DEBUG_KERNEL_ASPECT         3
 #define DEBUG_TENSOR_SOURCE_PREVIEW 4
-#define DEBUG_TENSOR_TRACE        5
-#define DEBUG_PASSTHROUGH         6
-#define DEBUG_DEPTH_RADIUS_FACTOR 7
-#define DEBUG_DETAIL_ONLY         8
-#define DEBUG_LOW_FREQUENCY       9
-#define DEBUG_DETAIL_DEPTH_MASK   10
-#define DEBUG_COLOR_ONLY_DETAIL   11
+#define DEBUG_TENSOR_TRACE          5
+#define DEBUG_PASSTHROUGH           6
+#define DEBUG_DEPTH_RADIUS_FACTOR   7
+#define DEBUG_DETAIL_ONLY           8
+#define DEBUG_LOW_FREQUENCY         9
+#define DEBUG_DETAIL_DEPTH_MASK     10
+#define DEBUG_COLOR_ONLY_DETAIL     11
 
 #define DEBUG_MODE DEBUG_FINAL_OUTPUT
 
@@ -53,9 +72,6 @@ float4 MainPS(float2 UV : TexCoord) : SV_Target
 {
     float2 TexelSize = View.BufferSizeAndInvSize.zw;
 
-    // New split pipeline: orientation from normals, anisotropy from scene color.
-    // See GilbertTensor.ush — ComputeDirectionData replaces the old
-    // AccumulateStructureTensor + SolveTensorDirectionAndAnisotropy two-step.
     FDirectionData DirectionData = ComputeDirectionData(UV, TexelSize);
 
     float KernelAspect      = 1.0;

@@ -41,6 +41,9 @@ float SafeRcp(float X)
 // SCENE ACCESSORS
 //////////////////////////////////////////////////////////////
 
+// Sample the world-space normal from GBufferA.
+// GBuffer normals don't change during post-processing, so
+// SceneTexturesStruct.GBufferATexture is always correct here.
 float3 GetWorldNormal(float2 UV)
 {
     float4 GBufferA = Texture2DSampleLevel(
@@ -53,11 +56,24 @@ float3 GetWorldNormal(float2 UV)
     return normalize(N);
 }
 
+// Sample the scene color at the current point in the post-process chain.
+//
+// IMPORTANT: We read from the explicit SceneColorTexture / SceneColorSampler
+// shader parameters (set in GilbertShadersViewExtension from InputSceneColor),
+// NOT from SceneTexturesStruct.SceneColorTexture.
+//
+// SceneTexturesStruct.SceneColorTexture is the raw scene color captured at
+// the end of the base pass — before DOF, bloom, and other post-process effects.
+// Since our pass runs AfterDOF, reading from that would sample stale data,
+// missing all the post-process effects applied before us.
+//
+// SceneColorTexture (the explicit parameter) is the live post-process chain
+// input — the texture that actually flows through the pipeline at our stage.
 float3 GetSceneColor(float2 UV)
 {
     float4 SceneColor = Texture2DSampleLevel(
-        SceneTexturesStruct.SceneColorTexture,
-        SceneTexturesStruct.PointClampSampler,
+        SceneColorTexture,
+        SceneColorSampler,
         UV,
         0);
 
@@ -70,6 +86,7 @@ float GetSceneLuma(float2 UV)
     return dot(Color, float3(0.299, 0.587, 0.114));
 }
 
+// Sample device-space depth (non-linear, [0,1]).
 float GetSceneDepthDeviceZ(float2 UV)
 {
     float SceneDepth = Texture2DSampleLevel(
@@ -81,12 +98,16 @@ float GetSceneDepthDeviceZ(float2 UV)
     return SceneDepth;
 }
 
+// Sample world-space depth (linear, in world units).
 float GetSceneDepthWorld(float2 UV)
 {
     float DeviceZ = GetSceneDepthDeviceZ(UV);
     return ConvertFromDeviceZ(DeviceZ);
 }
 
+// Returns a [0, 1] factor for depth-based kernel radius scaling.
+// 0 = near (small kernel), 1 = far (large kernel).
+// Returns 0 when DEPTH_RADIUS_ENABLE is off.
 float GetDepthRadiusFactor(float2 UV)
 {
 #if DEPTH_RADIUS_ENABLE
