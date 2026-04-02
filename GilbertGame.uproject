@@ -30,6 +30,22 @@
 		{
 			"Name": "MovieRenderPipeline",
 			"Enabled": true
+		},
+		{
+			"Name": "ControlRigPhysics",
+			"Enabled": true
+		},
+		{
+			"Name": "PhysicsControl",
+			"Enabled": true
+		},
+		{
+			"Name": "Locomotor",
+			"Enabled": true
+		},
+		{
+			"Name": "AnimatorKit",
+			"Enabled": true
 		}
 	]
 }
