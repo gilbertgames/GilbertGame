@@ -46,6 +46,10 @@
 		{
 			"Name": "AnimatorKit",
 			"Enabled": true
+		},
+		{
+			"Name": "SkeletalMeshMorphTargetEditingTools",
+			"Enabled": true
 		}
 	]
 }
