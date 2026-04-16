@@ -50,6 +50,10 @@
 		{
 			"Name": "SkeletalMeshMorphTargetEditingTools",
 			"Enabled": true
+		},
+		{
+			"Name": "TextureGraph",
+			"Enabled": true
 		}
 	]
 }
