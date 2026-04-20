@@ -54,6 +54,10 @@
 		{
 			"Name": "TextureGraph",
 			"Enabled": true
+		},
+		{
+			"Name": "MutableClothing",
+			"Enabled": true
 		}
 	]
 }
