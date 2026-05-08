@@ -58,6 +58,18 @@
 		{
 			"Name": "MutableClothing",
 			"Enabled": true
+		},
+		{
+			"Name": "ElectraCodecs",
+			"Enabled": true
+		},
+		{
+			"Name": "ElectraPlayer",
+			"Enabled": true
+		},
+		{
+			"Name": "VPxDecoderElectra",
+			"Enabled": true
 		}
 	]
 }
