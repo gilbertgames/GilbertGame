@@ -186,7 +186,27 @@ bool FMemoryFileHandle::Read(uint8* Destination, int64 BytesToRead)
 
 bool FMemoryFileHandle::ReadAt(uint8* Destination, int64 BytesToRead, int64 Offset)
 {
-	return false;
+	if (!bIsOpen)
+	{
+		return false;
+	}
+
+	if (Offset < 0 || Offset > Data.Num())
+	{
+		return false;
+	}
+
+	int64 BytesAvailable = Data.Num() - Offset;
+	int64 BytesToCopy = FMath::Min(BytesToRead, BytesAvailable);
+	
+	if (BytesToCopy <= 0)
+	{
+		return false;
+	}
+
+	FMemory::Memcpy(Destination, Data.GetData() + Offset, BytesToCopy);
+
+	return true;
 }
 
 bool FMemoryFileHandle::Write(const uint8* Source, int64 BytesToWrite)
@@ -333,16 +353,26 @@ bool FShaderOverridePlatformFile::SetReadOnly(const TCHAR* Filename, bool bIsRea
 	{
 		return false; // Cannot change read-only status
 	}
+	
 	return InnerFile->SetReadOnly(Filename, bIsReadOnly);
 }
 
 FDateTime FShaderOverridePlatformFile::GetTimeStamp(const TCHAR* Filename)
 {
-	return FDateTime();
+	if (ShouldInterceptFile(Filename))
+	{
+		return FDateTime::UtcNow();
+	}
+	
+	return InnerFile->GetTimeStamp(Filename);
 }
 
 void FShaderOverridePlatformFile::SetTimeStamp(const TCHAR* Filename, FDateTime DateTime)
 {
+	if (!ShouldInterceptFile(Filename))
+	{
+		InnerFile->SetTimeStamp(Filename, DateTime);
+	}
 }
 
 FDateTime FShaderOverridePlatformFile::GetAccessTimeStamp(const TCHAR* Filename)
@@ -417,11 +447,12 @@ FFileStatData FShaderOverridePlatformFile::GetStatData(const TCHAR* FilenameOrDi
 			return FFileStatData(
 				FDateTime::UtcNow(),
 				FDateTime::UtcNow(),
+				FDateTime::UtcNow(),
 				Bytes.Num(),
-				true,  // bIsFile
-				true,  // bIsReadOnly
-				false  // bIsValid
+				false,  // bIsInDirectory
+				true  // bIsReadOnly
 			);
+			// Note: bIsValid is automatically set to true by this constructor
 		}
 	}
 	return InnerFile->GetStatData(FilenameOrDirectory);
@@ -455,6 +486,45 @@ bool FShaderOverridePlatformFile::IterateDirectoryStat(const TCHAR* Directory, F
 bool FShaderOverridePlatformFile::IterateDirectoryStatRecursively(const TCHAR* Directory, FDirectoryStatVisitor& Visitor)
 {
 	return InnerFile->IterateDirectoryStatRecursively(Directory, Visitor);
+}
+
+//-----------------------------------------------------------------------------
+// FileJournal API - delegate to InnerFile for UE 5.7 incremental asset discovery
+//-----------------------------------------------------------------------------
+
+bool FShaderOverridePlatformFile::FileJournalIsAvailable(const TCHAR* VolumeOrPath, ELogVerbosity::Type* OutErrorLevel, FString* OutError)
+{
+	return InnerFile->FileJournalIsAvailable(VolumeOrPath, OutErrorLevel, OutError);
+}
+
+uint64 FShaderOverridePlatformFile::FileJournalGetMaximumSize(const TCHAR* VolumeOrPath, ELogVerbosity::Type* OutErrorLevel, FString* OutError) const
+{
+	return InnerFile->FileJournalGetMaximumSize(VolumeOrPath, OutErrorLevel, OutError);
+}
+
+EFileJournalResult FShaderOverridePlatformFile::FileJournalGetLatestEntry(const TCHAR* VolumeName, FFileJournalId& OutJournalId, FFileJournalEntryHandle& OutEntryHandle, FString* OutError)
+{
+	return InnerFile->FileJournalGetLatestEntry(VolumeName, OutJournalId, OutEntryHandle, OutError);
+}
+
+bool FShaderOverridePlatformFile::FileJournalIterateDirectory(const TCHAR* Directory, FDirectoryJournalVisitorFunc Visitor, FString* OutError)
+{
+	return InnerFile->FileJournalIterateDirectory(Directory, MoveTemp(Visitor), OutError);
+}
+
+FFileJournalData FShaderOverridePlatformFile::FileJournalGetFileData(const TCHAR* FilenameOrDirectory, FString* OutError)
+{
+	return InnerFile->FileJournalGetFileData(FilenameOrDirectory, OutError);
+}
+
+EFileJournalResult FShaderOverridePlatformFile::FileJournalReadModified(const TCHAR* VolumeName, const FFileJournalId& JournalIdOfStartingEntry, const FFileJournalEntryHandle& StartingJournalEntry, TMap<FFileJournalFileHandle, FString>& KnownDirectories, TSet<FString>& OutModifiedDirectories, FFileJournalEntryHandle& OutNextJournalEntry, FString* OutError)
+{
+	return InnerFile->FileJournalReadModified(VolumeName, JournalIdOfStartingEntry, StartingJournalEntry, KnownDirectories, OutModifiedDirectories, OutNextJournalEntry, OutError);
+}
+
+FString FShaderOverridePlatformFile::FileJournalGetVolumeName(FStringView InPath)
+{
+	return InnerFile->FileJournalGetVolumeName(InPath);
 }
 
 //-----------------------------------------------------------------------------

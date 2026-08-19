@@ -2,19 +2,26 @@
 // Modified by TonemapOverride Plugin
 
 /*=============================================================================
-	LUTBlender.usf: Filter pixel shader source.   
+	PostProcessCombineLUTs.usf: Filter pixel shader source.
 
-	This file shadows Engine/Shaders/Private/PostProcessCombineLUTs.usf.
+	This file shadows Engine/Shaders/Private/PostProcessCombineLUTs.usf (UE 5.8).
 	The TonemapOverride plugin injects custom tonemapping operators at the
 	LUT baking stage (FilmToneMap call), so color grading works properly.
+
+	UE 5.8 port notes:
+	* The custom curve replaces FilmToneMap() inside ComputeFilmColorNoGamma(),
+	  i.e. the TONEMAPPING_METHOD_Filmic tone curve. If the project runs the
+	  ACES 2.0 method (TONEMAPPING_METHOD_ACES), the engine bakes its transform
+	  through the InnerLUT instead and the custom modes are bypassed (same
+	  deference to ACES the 5.7 plugin had on HDR outputs).
+	* ACES-specific steps (wide-gamut expand, blue correction, LUT headroom
+	  squish) compile out for custom modes, matching the 5.7 plugin.
+	* 5.8 made this pass compute-only and replaced the fixed 1.05 LUT headroom
+	  with the LUTInvMax/LUTMax uniform pair.
 
 	Note: Any changes to device encoding logic in CombineLUTsCommon() must
 	also be made in PostProcessDeviceEncodingOnly.usf.
 =============================================================================*/
-
-#define USE_COLOR_MATRIX	1
-#define USE_SHADOW_TINT		1
-#define USE_CONTRAST		1
 
 #include "Common.ush"
 #include "PostProcessCommon.ush"
@@ -25,12 +32,12 @@
 //   1 = AgX (Punchy)
 //   2 = Reinhard
 //   3 = Linear (no tonemapping)
-//   4 = Custom (see TonemapCustom.ush)
+//   4 = Khronos PBR Neutral
+//   5 = Custom (see CustomTonemapOperator below)
 
-// TODO: Read this from project settings. For now, set it manually here:
-#ifndef CUSTOM_TONEMAP_MODE
-	#define CUSTOM_TONEMAP_MODE 1  // Change this to switch tonemappers
-#endif
+
+#define CUSTOM_TONEMAP_MODE 1  // Change this to switch tonemappers
+
 
 // 0: Default, 1: Golden, 2: Punchy
 
@@ -54,10 +61,27 @@ DECLARE_SCALAR_ARRAY(float, LUTWeights, 5);
 half3 ColorScale;
 half4 OverlayColor;
 
-uint bUseMobileTonemapper;
+float3 LimitingRgbToXYZ0;
+float3 LimitingRgbToXYZ1;
+float3 LimitingRgbToXYZ2;
+float3x3 GetLimitingRgbToXYZ()
+{
+	return float3x3(LimitingRgbToXYZ0, LimitingRgbToXYZ1, LimitingRgbToXYZ2);
+}
+
+float3 LimitingXYZToRgb0;
+float3 LimitingXYZToRgb1;
+float3 LimitingXYZToRgb2;
+float3x3 GetLimitingXYZToRgb()
+{
+	return float3x3(LimitingXYZToRgb0, LimitingXYZToRgb1, LimitingXYZToRgb2);
+}
+
 uint bIsTemperatureWhiteBalance;
 
+float LUTInvMax;
 float LUTSize;
+float InnerLUTSize;
 
 float WhiteTemp;
 float WhiteTint;
@@ -90,23 +114,10 @@ float  ColorCorrectionShadowsMax;
 float  ColorCorrectionHighlightsMin;
 float  ColorCorrectionHighlightsMax;
 
-float4 ACESMinMaxData;
-float4 ACESMidData;
-float4 ACESCoefsLow_0;
-float4 ACESCoefsHigh_0;
-float ACESCoefsLow_4;
-float ACESCoefsHigh_4;
-float ACESSceneColorMultiplier;
-float ACESGamutCompression;
-
-// ACES 2.0
-Texture2D<float> ACESReachTable;
-Texture2D<float> ACESGamutTable;
-Texture2D<float> ACESGammaTable;
-
 static const float DefaultTemperature = 6500.0;
 static const float DefaultTint = 0.0;
 static const float Epsilon = 1e-8;
+static const float Bt1886Gamma = 2.4;
 
 float3 ColorCorrect( float3 WorkingColor,
 	float4 ColorSaturation,
@@ -165,6 +176,7 @@ float3 ColorCorrectAll( float3 WorkingColor )
 uint OutputDevice;
 uint OutputGamut;
 float OutputMaxLuminance;
+uint LUTShaper;
 
 uint GetOutputDevice()
 {
@@ -367,6 +379,38 @@ float3 CustomTonemapOperator(float3 LinearColor)
 	return saturate(Mapped * WhiteScale);
 }
 
+// Khronos PBR Neutral tonemapper
+// Reference: https://github.com/KhronosGroup/ToneMapping/tree/main/PBR_Neutral
+// Input/output: Linear Rec. 709 (sRGB primaries), output in [0, 1]
+float3 PBRNeutralToneMapping(float3 Color)
+{
+	const float StartCompression = 0.8 - 0.04;
+	const float Desaturation = 0.15;
+
+	float x = min(Color.r, min(Color.g, Color.b));
+	float Offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+	Color -= Offset;
+
+	float Peak = max(Color.r, max(Color.g, Color.b));
+	if (Peak < StartCompression) return Color;
+
+	const float d = 1.0 - StartCompression;
+	float NewPeak = 1.0 - d * d / (Peak + d - StartCompression);
+	Color *= NewPeak / Peak;
+
+	float g = 1.0 - 1.0 / (Desaturation * (Peak - NewPeak) + 1.0);
+	return lerp(Color, NewPeak * float3(1, 1, 1), g);
+}
+
+float3 ApplyKPBRN(float3 ColorAP1)
+{
+	const float3x3 AP1_2_sRGB = mul( XYZ_2_sRGB_MAT, mul( D60_2_D65_CAT, AP1_2_XYZ_MAT ) );
+	const float3x3 sRGB_2_AP1 = mul( XYZ_2_AP1_MAT, mul( D65_2_D60_CAT, sRGB_2_XYZ_MAT ) );
+	float3 LinearSRGB = mul(AP1_2_sRGB, ColorAP1);
+	LinearSRGB = PBRNeutralToneMapping(LinearSRGB);
+	return mul(sRGB_2_AP1, LinearSRGB);
+}
+
 // Custom tonemap dispatcher - replaces FilmToneMap()
 float3 CustomFilmToneMap(float3 ColorAP1)
 {
@@ -380,8 +424,10 @@ float3 CustomFilmToneMap(float3 ColorAP1)
 		// Linear (no tonemapping)
 		return saturate(ColorAP1);
 	#elif CUSTOM_TONEMAP_MODE == 4
-		// Custom (user-defined in TonemapCustom.ush)
-		// Convert to sRGB for custom operator
+		// Khronos PBR Neutral
+		return ApplyKPBRN(ColorAP1);
+	#elif CUSTOM_TONEMAP_MODE == 5
+		// Custom (user-defined below in CustomTonemapOperator)
 		const float3x3 AP1_2_sRGB = mul( XYZ_2_sRGB_MAT, mul( D60_2_D65_CAT, AP1_2_XYZ_MAT ) );
 		float3 LinearSRGB = mul(AP1_2_sRGB, ColorAP1);
 		LinearSRGB = CustomTonemapOperator(LinearSRGB);
@@ -396,102 +442,14 @@ float3 CustomFilmToneMap(float3 ColorAP1)
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-float4 CombineLUTsCommon(float2 InUV, uint InLayerIndex)
+float3 ComputeFilmColorNoGamma(float3 ColorAP1)
 {
-#if USE_VOLUME_LUT == 1
-	// construct the neutral color from a 3d position volume texture	
-	float4 Neutral;
-	{
-		float2 UV = InUV - float2(0.5f / LUTSize, 0.5f / LUTSize);
-
-		Neutral = float4(UV * LUTSize / (LUTSize - 1), InLayerIndex / (LUTSize - 1), 0);
-	}
-#else
-	// construct the neutral color from a 2d position in 256x16
-	float4 Neutral;
-	{ 
-		float2 UV = InUV;
-
-		// 0.49999f instead of 0.5f to avoid getting into negative values
-		UV -= float2(0.49999f / (LUTSize * LUTSize), 0.49999f / LUTSize);
-
-		float Scale = LUTSize / (LUTSize - 1);
-
-		float3 RGB;
-		
-		RGB.r = frac(UV.x * LUTSize);
-		RGB.b = UV.x - RGB.r / LUTSize;
-		RGB.g = UV.y;
-
-		Neutral = float4(RGB * Scale, 0);
-	}
-#endif
-
-	float4 OutColor = 0;
-	
-	const float3x3 AP1_2_sRGB = mul( XYZ_2_sRGB_MAT, mul( D60_2_D65_CAT, AP1_2_XYZ_MAT ) );
+#if CUSTOM_TONEMAP_MODE == 0
+	// Blue correction for ACES: corrects ACES's tendency to desaturate blues.
+	// Bypassed for all other tonemappers — the forward+inverse pair doesn’t cancel
+	// cleanly through a nonlinear tonemapper, leaving a residual color shift.
 	const float3x3 AP0_2_AP1 = mul( XYZ_2_AP1_MAT, AP0_2_XYZ_MAT );
 	const float3x3 AP1_2_AP0 = mul( XYZ_2_AP0_MAT, AP1_2_XYZ_MAT );
-
-	const float3x3 AP1_2_Output  = OuputGamutMappingMatrix( OutputGamut );
-
-	float3 LUTEncodedColor = Neutral.rgb;
-	float3 LinearColor;
-	// Decode texture values as ST-2084 (Dolby PQ)
-	BRANCH
-	if (GetOutputDevice() >= TONEMAPPER_OUTPUT_ACES1000nitST2084)
-	{
-		// Since ST2084 returns linear values in nits, divide by a scale factor to convert
-		// the reference nit result to be 1.0 in linear.
-		// (for efficiency multiply by precomputed inverse)
-		LinearColor = ST2084ToLinear(LUTEncodedColor) * LinearToNitsScaleInverse;
-	}
-	// Decode log values
-	else
-	{
-		LinearColor = LogToLin(LUTEncodedColor) - LogToLin(0);
-	}
-
-	float3 BalancedColor = LinearColor;
-	
-	BRANCH
-	if( abs(WhiteTemp - DefaultTemperature) > Epsilon || abs(WhiteTint - DefaultTint) > Epsilon )
-	{
-		BalancedColor = WhiteBalance(LinearColor, WhiteTemp, WhiteTint, bIsTemperatureWhiteBalance, (float3x3)WorkingColorSpace.ToXYZ, (float3x3)WorkingColorSpace.FromXYZ);
-	}
-
-	float3 ColorAP1 = mul( (float3x3)WorkingColorSpace.ToAP1, BalancedColor );
-
-	// Expand bright saturated colors outside the sRGB gamut to fake wide gamut rendering.
- 	float  LumaAP1 = dot( ColorAP1, AP1_RGB2Y );
-	float3 ChromaAP1 = ColorAP1 / LumaAP1;
-
-	float ChromaDistSqr = dot( ChromaAP1 - 1, ChromaAP1 - 1 );
-	float ExpandAmount = ( 1 - exp2( -4 * ChromaDistSqr ) ) * ( 1 - exp2( -4 * ExpandGamut * LumaAP1*LumaAP1 ) );
-
-	// Bizarre matrix but this expands sRGB to between P3 and AP1
-	// CIE 1931 chromaticities:	x		y
-	//				Red:		0.6965	0.3065
-	//				Green:		0.245	0.718
-	//				Blue:		0.1302	0.0456
-	//				White:		0.3127	0.329
-	const float3x3 Wide_2_XYZ_MAT = 
-	{
-		0.5441691,  0.2395926,  0.1666943,
-		0.2394656,  0.7021530,  0.0583814,
-		-0.0023439,  0.0361834,  1.0552183,
-	};
-
-	const float3x3 Wide_2_AP1 = mul( XYZ_2_AP1_MAT, Wide_2_XYZ_MAT );
-	const float3x3 ExpandMat = mul( Wide_2_AP1, AP1_2_sRGB );
-
-	float3 ColorExpand = mul( ExpandMat, ColorAP1 );
-	ColorAP1 = lerp( ColorAP1, ColorExpand, ExpandAmount );
-
-	ColorAP1 = ColorCorrectAll( ColorAP1 );
-
-	// Store for Linear HDR output without tone curve
-	float3 GradedColor = mul( (float3x3)WorkingColorSpace.FromAP1, ColorAP1 );
 
 	const float3x3 BlueCorrect =
 	{
@@ -501,7 +459,7 @@ float4 CombineLUTsCommon(float2 InUV, uint InLayerIndex)
 	};
 	const float3x3 BlueCorrectInv =
 	{
-		1.06318,     0.0233956, -0.0865726,
+		 1.06318,     0.0233956, -0.0865726,
 		-0.0106337,   1.20632,   -0.19569,
 		-0.000590887, 0.00105248, 0.999538
 	};
@@ -510,14 +468,17 @@ float4 CombineLUTsCommon(float2 InUV, uint InLayerIndex)
 
 	// Blue correction
 	ColorAP1 = lerp( ColorAP1, mul( BlueCorrectAP1, ColorAP1 ), BlueCorrection );
+#endif // CUSTOM_TONEMAP_MODE == 0
 
 	// ── PLUGIN OVERRIDE: Custom tonemapping replaces FilmToneMap ────────────
 	// Tonemapped color in the AP1 gamut
 	float3 ToneMappedColorAP1 = CustomFilmToneMap( ColorAP1 );
 	ColorAP1 = lerp(ColorAP1, ToneMappedColorAP1, ToneCurveAmount);
 
+#if CUSTOM_TONEMAP_MODE == 0
 	// Uncorrect blue to maintain white point
 	ColorAP1 = lerp( ColorAP1, mul( BlueCorrectInvAP1, ColorAP1 ), BlueCorrection );
+#endif // CUSTOM_TONEMAP_MODE == 0
 
 	// Convert from AP1 to the working color space and clip out-of-gamut values
 	float3 FilmColor = max(0, mul( (float3x3)WorkingColorSpace.FromAP1, ColorAP1 ));
@@ -562,93 +523,245 @@ float4 CombineLUTsCommon(float2 InUV, uint InLayerIndex)
 
 	// blend with custom LDR color, used for Fade track in Cinematics
 	float3 FilmColorNoGamma = lerp( FilmColor * ColorScale, OverlayColor.rgb, OverlayColor.a );
-	// Apply Fade track to linear outputs also
+	return FilmColorNoGamma;
+}
+
+float3 ComputeGradedColor(float3 ColorAP1)
+{
+	// Store for Linear HDR output without tone curve
+	float3 GradedColor = mul( (float3x3)WorkingColorSpace.FromAP1, ColorAP1 );
+
+	// blend with custom LDR color, used for Fade track in Cinematics
 	GradedColor = lerp(GradedColor * ColorScale, OverlayColor.rgb, OverlayColor.a);
 
+	return GradedColor;
+}
+
+#define INVEOTF_LINEAR 0
+#define INVEOTF_PQ 1
+
+float3 ApplyInvEOTF(float3 Color, int InvEOTF)
+{
+	if (InvEOTF == INVEOTF_PQ)
+	{
+		// Apply conversion to ST-2084 (Dolby PQ)
+		Color = LinearToST2084(Color * LinearToNitsScale);
+	}
+
+	return Color;
+}
+
+Texture3D InnerLUT;
+SamplerState InnerLUTSampler;
+
+float3 InnerLookupTable(float3 LUTEncodedColor, int InvEOTF)
+{
+	float InvInnerLUTSize = 1. / InnerLUTSize;
+	float InnerLUTScale = 1. - InvInnerLUTSize;
+	float InnerLUTOffset = .5 * InvInnerLUTSize;
+	float3 UVW = mad(LUTEncodedColor, InnerLUTScale, InnerLUTOffset);
+
+	float3 Color = Texture3DSample(InnerLUT, InnerLUTSampler, UVW).rgb;
+
+	if (OutputMaxLuminance > LinearToNitsScale)
+	{
+		if (InvEOTF != INVEOTF_PQ)
+		{
+			Color = ST2084ToLinear(Color) * LinearToNitsScaleInverse;
+			Color = ApplyInvEOTF(Color, InvEOTF);
+		}
+	}
+	else
+	{
+		Color = sRGBToLinear(Color);
+		Color = ApplyInvEOTF(Color, InvEOTF);
+	}
+
+	return Color;
+}
+
+#define TONEMAPPING_SDR_INVEOTF_SRGB 0
+#define TONEMAPPING_SDR_INVEOTF_BT1886 1
+uint TonemappingSDRInvEOTF;
+
+float3 ApplyToneCurve(float3 ColorAP1, float PeakLuminance, float3x3 AP1_2_Output, int InvEOTF)
+{
+#if TONEMAPPING_METHOD == TONEMAPPING_METHOD_ACES
+	float3 GradedColor = ComputeGradedColor(ColorAP1);
+	float3 GradedColorAP1 = mul( (float3x3)WorkingColorSpace.ToAP1, GradedColor );
+	float3 LUTEncodedColor = LinearToST2084(clamp(GradedColorAP1 * LinearToNitsScale, 0.0, 10000.0));
+	float3 OutputGamutColor = InnerLookupTable(LUTEncodedColor, InvEOTF);
+#elif TONEMAPPING_METHOD == TONEMAPPING_METHOD_Filmic
+	float3 FilmColorNoGamma = ComputeFilmColorNoGamma(ColorAP1);
 
 	// Apply "gamma" curve adjustment.
-	FilmColor = pow( max(0, FilmColorNoGamma), InverseGamma.y );
-		
+	float3 FilmColor = pow( max(0, FilmColorNoGamma), InverseGamma.y );
+
+	// FIXME: Workaround for UE-29935, pushing all colors with a 0 component to black output
+	// Default parameters seem to cancel out (sRGB->XYZ->AP1->XYZ->sRGB), so should be okay for a temp fix
+	float3 OutputGamutColor = WorkingColorSpace.bIsSRGB && (OutputGamut == TONEMAPPER_GAMUT_sRGB_D65) ?
+		FilmColor :
+		mul( AP1_2_Output, mul( (float3x3)WorkingColorSpace.ToAP1, FilmColor ) );
+
+#if !OUTPUT_DEVICE_SRGB
+	// "Automatic HDR" using ACES to remap filmic.
+	if (PeakLuminance > LinearToNitsScale)
+	{
+		// Rec. 2100 specifies a dim environment similar to various viewing standards, e.g. BT.2035, for consuming Rec. 709 w/BT.1886.
+		// sRGB is meant to be viewed in a bright office, so its EOTF leaves values a bit inflated in comparison to BT.1886.
+		// This adjustment converts from "bright" linear space to "dim" linear space.
+		if (TonemappingSDRInvEOTF == TONEMAPPING_SDR_INVEOTF_SRGB)
+		{
+			// Apply inverse of sRGB EOTF to generate nonlinear values that would get sent to an SDR display.
+			OutputGamutColor = LinearToSrgb(OutputGamutColor);
+			// Apply BT.1886 EOTF to linearize the values into "dim" linear space.
+			OutputGamutColor = pow(OutputGamutColor, Bt1886Gamma);
+		}
+
+		// Use PQ shaper to preserve shadow detail and normalize for SDR by using the reciprocal of ST2084 at 100 nits.
+		float3 LUTEncodedColor = LinearToST2084(clamp(OutputGamutColor * LinearToNitsScale, 0.0, 10000.0)) * 1.9682001;
+		OutputGamutColor = InnerLookupTable(LUTEncodedColor, InvEOTF);
+	}
+	else
+#endif
+	{
+		OutputGamutColor = ApplyInvEOTF(OutputGamutColor, InvEOTF);
+	}
+#else
+#error Unknown TONEMAPPING_METHOD
+#endif
+
+	return OutputGamutColor;
+}
+
+float4 CombineLUTsCommon(float3 LUTEncodedColor)
+{
+	float4 OutColor = 0;
+
+	const float3x3 AP1_2_sRGB = mul( XYZ_2_sRGB_MAT, mul( D60_2_D65_CAT, AP1_2_XYZ_MAT ) );
+	const float3x3 AP1_2_Output = OutputGamutMappingMatrix( OutputGamut );
+
+	float3 LinearColor;
+	// Decode texture values as ST-2084 (Dolby PQ)
+	BRANCH
+	if (LUTShaper)
+	{
+		// Since ST2084 returns linear values in nits, divide by a scale factor to convert
+		// the reference nit result to be 1.0 in linear.
+		// (for efficiency multiply by precomputed inverse)
+		LinearColor = ST2084ToLinear(LUTEncodedColor) * LinearToNitsScaleInverse;
+	}
+	// Decode log values
+	else
+	{
+		LinearColor = LogToLin(LUTEncodedColor) - LogToLin(0);
+	}
+
+	float3 BalancedColor = LinearColor;
+
+	BRANCH
+	if( abs(WhiteTemp - DefaultTemperature) > Epsilon || abs(WhiteTint - DefaultTint) > Epsilon )
+	{
+		BalancedColor = WhiteBalance(LinearColor, WhiteTemp, WhiteTint, bIsTemperatureWhiteBalance, (float3x3)WorkingColorSpace.ToXYZ, (float3x3)WorkingColorSpace.FromXYZ);
+	}
+
+	float3 ColorAP1 = mul( (float3x3)WorkingColorSpace.ToAP1, BalancedColor );
+
+#if CUSTOM_TONEMAP_MODE == 0
+	// Expand bright saturated colors outside the sRGB gamut to fake wide gamut rendering.
+	// ACES-specific: bypassed for all other tonemappers.
+ 	float  LumaAP1 = dot( ColorAP1, AP1_RGB2Y );
+	float3 ChromaAP1 = ColorAP1 / LumaAP1;
+
+	float ChromaDistSqr = dot( ChromaAP1 - 1, ChromaAP1 - 1 );
+	float ExpandAmount = ( 1 - exp2( -4 * ChromaDistSqr ) ) * ( 1 - exp2( -4 * ExpandGamut * LumaAP1*LumaAP1 ) );
+
+	// Bizarre matrix but this expands sRGB to between P3 and AP1
+	// CIE 1931 chromaticities:	x		y
+	//				Red:		0.6965	0.3065
+	//				Green:		0.245	0.718
+	//				Blue:		0.1302	0.0456
+	//				White:		0.3127	0.329
+	const float3x3 Wide_2_XYZ_MAT = 
+	{
+		0.5441691,  0.2395926,  0.1666943,
+		0.2394656,  0.7021530,  0.0583814,
+		-0.0023439,  0.0361834,  1.0552183,
+	};
+
+	const float3x3 Wide_2_AP1 = mul( XYZ_2_AP1_MAT, Wide_2_XYZ_MAT );
+	const float3x3 ExpandMat = mul( Wide_2_AP1, AP1_2_sRGB );
+
+	float3 ColorExpand = mul( ExpandMat, ColorAP1 );
+	ColorAP1 = lerp( ColorAP1, ColorExpand, ExpandAmount );
+#endif // CUSTOM_TONEMAP_MODE == 0
+
+	ColorAP1 = ColorCorrectAll( ColorAP1 );
+
 	// Note: Any changes to the following device encoding logic must also be made 
 	// in PostProcessDeviceEncodingOnly.usf's corresponding pixel shader.
 	half3 OutDeviceColor = 0;
-	BRANCH
 
 	// sRGB, user specified gamut
-	if( GetOutputDevice() == TONEMAPPER_OUTPUT_sRGB)
-	{		
-		// Convert from sRGB to specified output gamut	
-		//float3 OutputGamutColor = mul( AP1_2_Output, mul( sRGB_2_AP1, FilmColor ) );
+	BRANCH if( GetOutputDevice() == TONEMAPPER_OUTPUT_sRGB)
+	{
+		float3 OutputGamutColor = ApplyToneCurve(ColorAP1, LinearToNitsScale, AP1_2_Output, INVEOTF_LINEAR);
 
-		// FIXME: Workaround for UE-29935, pushing all colors with a 0 component to black output
-		// Default parameters seem to cancel out (sRGB->XYZ->AP1->XYZ->sRGB), so should be okay for a temp fix
-		float3 OutputGamutColor = WorkingColorSpace.bIsSRGB ? FilmColor : mul( AP1_2_Output, mul( (float3x3)WorkingColorSpace.ToAP1, FilmColor ) );
-
-		// Apply conversion to sRGB (this must be an exact sRGB conversion else darks are bad).
-		OutDeviceColor = LinearToSrgb( OutputGamutColor );
+		BRANCH if (TonemappingSDRInvEOTF == TONEMAPPING_SDR_INVEOTF_SRGB)
+		{
+			OutDeviceColor = LinearToSrgb(OutputGamutColor);
+		}
+		else // TonemappingSDRInvEOTF == TONEMAPPING_SDR_INVEOTF_BT1886
+		{
+			OutDeviceColor = pow(OutputGamutColor, 1. / Bt1886Gamma);
+		}
 	}
 
 	// Rec 709, user specified gamut
-	else if( GetOutputDevice() == TONEMAPPER_OUTPUT_Rec709)
+	else BRANCH if( GetOutputDevice() == TONEMAPPER_OUTPUT_Rec709)
 	{
-		// Convert from the working color space to specified output gamut
-		float3 OutputGamutColor = mul( AP1_2_Output, mul( (float3x3)WorkingColorSpace.ToAP1, FilmColor ) );
+		float3 OutputGamutColor = ApplyToneCurve(ColorAP1, LinearToNitsScale, AP1_2_Output, INVEOTF_LINEAR);
 
 		// Didn't profile yet if the branching version would be faster (different linear segment).
-		OutDeviceColor = LinearTo709Branchless( OutputGamutColor );
+		OutDeviceColor = LinearTo709Branchless(OutputGamutColor);
 	}
 
-	// ACES transform with PQ/2084 encoding, user specified gamut 
-	else if( GetOutputDevice() == TONEMAPPER_OUTPUT_ACES1000nitST2084 || GetOutputDevice() == TONEMAPPER_OUTPUT_ACES2000nitST2084)
+	// Transform with PQ/2084 encoding, user specified gamut
+	else BRANCH if( GetOutputDevice() == TONEMAPPER_OUTPUT_ACES1000nitST2084 || GetOutputDevice() == TONEMAPPER_OUTPUT_ACES2000nitST2084)
 	{
-#if USE_ACES_2
-		float3 ODTColor = ACESOutputTransform(GradedColor * ACESSceneColorMultiplier, (float3x3) WorkingColorSpace.ToAP0, OutputMaxLuminance, ACESReachTable, ACESGamutTable, ACESGammaTable);
-#else
-		FACESTonemapParams AcesParams = ComputeACESTonemapParams(ACESMinMaxData, ACESMidData, ACESCoefsLow_0, ACESCoefsHigh_0, ACESCoefsLow_4, ACESCoefsHigh_4, ACESSceneColorMultiplier, ACESGamutCompression);
-		float3 ODTColor = ACESOutputTransform( GradedColor, (float3x3)WorkingColorSpace.ToAP0, AcesParams);
-#endif
-		ODTColor = mul(AP1_2_Output, ODTColor);
-
-		// Apply conversion to ST-2084 (Dolby PQ)
-		OutDeviceColor = LinearToST2084( ODTColor );
+		OutDeviceColor = ApplyToneCurve(ColorAP1, OutputMaxLuminance, AP1_2_Output, INVEOTF_PQ);
 	}
 
-	// ACES transform with PQ/2084 encoding, AP1 gamut
-	else if( GetOutputDevice() == TONEMAPPER_OUTPUT_ACES1000nitScRGB || GetOutputDevice() == TONEMAPPER_OUTPUT_ACES2000nitScRGB)
+	// Transform to linear ScRGB
+	else BRANCH if( GetOutputDevice() == TONEMAPPER_OUTPUT_ACES1000nitScRGB || GetOutputDevice() == TONEMAPPER_OUTPUT_ACES2000nitScRGB)
 	{
-#if USE_ACES_2
-		float3 ODTColor = ACESOutputTransform(GradedColor * ACESSceneColorMultiplier, (float3x3) WorkingColorSpace.ToAP0, OutputMaxLuminance, ACESReachTable, ACESGamutTable, ACESGammaTable);
-#else
-		FACESTonemapParams AcesParams = ComputeACESTonemapParams(ACESMinMaxData, ACESMidData, ACESCoefsLow_0, ACESCoefsHigh_0, ACESCoefsLow_4, ACESCoefsHigh_4, ACESSceneColorMultiplier, ACESGamutCompression);
-		float3 ODTColor = ACESOutputTransform( GradedColor, (float3x3)WorkingColorSpace.ToAP0, AcesParams);
-#endif
-		OutDeviceColor = mul(AP1_2_sRGB, ODTColor / UE_SCRGB_WHITE_NITS);
-	}	
-	
-	else if( GetOutputDevice() == TONEMAPPER_OUTPUT_LinearEXR)
+		float3 OutputGamutColor = ApplyToneCurve(ColorAP1, OutputMaxLuminance, AP1_2_Output, INVEOTF_LINEAR);
+		OutDeviceColor = (LinearToNitsScale / UE_SCRGB_WHITE_NITS) * OutputGamutColor;
+	}
+
+	else BRANCH if( GetOutputDevice() == TONEMAPPER_OUTPUT_LinearEXR)
 	{
-			float3 OutputGamutColor = mul( AP1_2_Output, mul( (float3x3)WorkingColorSpace.ToAP1, GradedColor ) );
-			OutDeviceColor = LinearToST2084( OutputGamutColor );
+		float3 GradedColor = ComputeGradedColor(ColorAP1);
+		float3 OutputGamutColor = mul( AP1_2_Output, mul( (float3x3)WorkingColorSpace.ToAP1, GradedColor ) );
+		OutDeviceColor = LinearToST2084( OutputGamutColor );
 	}
 	// Linear HDR, including all color correction, but no tone curve
-	else if( GetOutputDevice() == TONEMAPPER_OUTPUT_NoToneCurve)
+	else BRANCH if( GetOutputDevice() == TONEMAPPER_OUTPUT_NoToneCurve)
 	{
-			OutDeviceColor = GradedColor;
+		float3 GradedColor = ComputeGradedColor(ColorAP1);
+		OutDeviceColor = GradedColor;
 	}
 	// "Linear" including all color correction and the tone curve, but no device gamma
-	else if (GetOutputDevice() == TONEMAPPER_OUTPUT_WithToneCurve)
+	else BRANCH if (GetOutputDevice() == TONEMAPPER_OUTPUT_WithToneCurve)
 	{
-		float3 OutputGamutColor = mul( AP1_2_Output, mul( (float3x3)WorkingColorSpace.ToAP1, FilmColorNoGamma ) );
-
-		OutDeviceColor = OutputGamutColor;
+		OutDeviceColor = ApplyToneCurve(ColorAP1, LinearToNitsScale, AP1_2_Output, INVEOTF_LINEAR);
 	}
 
 	// OutputDevice == TONEMAPPER_OUTPUT_ExplicitGammaMapping
 	// Gamma 2.2, user specified gamut
 	else
 	{
-		// Convert from the working color space to specified output gamut
-		float3 OutputGamutColor = mul( AP1_2_Output, mul( (float3x3)WorkingColorSpace.ToAP1, FilmColor ) );
+		float3 OutputGamutColor = ApplyToneCurve(ColorAP1, LinearToNitsScale, AP1_2_Output, INVEOTF_LINEAR);
 
 		// This is different than the prior "gamma" curve adjustment (but reusing the variable).
 		// For displays set to a gamma colorspace.
@@ -656,61 +769,29 @@ float4 CombineLUTsCommon(float2 InUV, uint InLayerIndex)
 		OutDeviceColor = pow( OutputGamutColor, InverseGamma.z );
 	}
 
-	// Better to saturate(lerp(a,b,t)) than lerp(saturate(a),saturate(b),t)
+	// Some functions output values slightly above 1. Undo this squishing in PostProcessTonemap.usf
 #if CUSTOM_TONEMAP_MODE == 0
-    OutColor.rgb = OutDeviceColor / 1.05;
+	OutColor.rgb = OutDeviceColor * LUTInvMax;
 #else
-    OutColor.rgb = OutDeviceColor;
-#endif
+	// Custom curves already peak at 1.0 — skip the headroom squish. PostProcessTonemap
+	// still multiplies LUT samples by LUTMax, reproducing the 5.7 plugin's behavior.
+	OutColor.rgb = OutDeviceColor;
+#endif // CUSTOM_TONEMAP_MODE == 0
 	OutColor.a = 0;
 
 	return OutColor;
 }
 
-// todo: Weight[0] should be used for neutral, Texture* name should start with 1, color correction should apply on top of that
-#if USE_VOLUME_LUT == 1
-void MainPS(FWriteToSliceGeometryOutput Input, out float4 OutColor : SV_Target0)
-{
-	OutColor = CombineLUTsCommon(Input.Vertex.UV, Input.LayerIndex);
-}
-#else
-void MainPS(noperspective float4 InUV : TEXCOORD0, out float4 OutColor : SV_Target0)
-{
-	OutColor = CombineLUTsCommon(InUV.xy, 0);
-}
-#endif
+float InvLUTSizeMinusOne;
 
-#if COMPUTESHADER
-// xy: Unused, zw: ThreadToUVScale
-float2 OutputExtentInverse;
-
-#if USE_VOLUME_LUT == 1
 RWTexture3D<float4> RWOutputTexture;
 
 [numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, THREADGROUP_SIZE)]
 void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID) 
 {
-	float2 UV = ((float2)DispatchThreadId.xy + 0.5f) * OutputExtentInverse;
-	uint LayerIndex = DispatchThreadId.z;
-	
-	float4 OutColor = CombineLUTsCommon(UV, LayerIndex);
+	float3 LUTEncodedColor = (float3)DispatchThreadId * InvLUTSizeMinusOne;
+	float4 OutColor = CombineLUTsCommon(LUTEncodedColor);
 
 	uint3 PixelPos = DispatchThreadId;
 	RWOutputTexture[PixelPos] = OutColor;
 }
-#else
-RWTexture2D<float4> RWOutputTexture;
-
-[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
-void MainCS(uint2 DispatchThreadId : SV_DispatchThreadID)
-{
-	float2 UV = ((float2)DispatchThreadId + 0.5f) * OutputExtentInverse;
-	uint LayerIndex = 0;
-	
-	float4 OutColor = CombineLUTsCommon(UV, LayerIndex);
-
-	uint2 PixelPos = DispatchThreadId;
-	RWOutputTexture[PixelPos] = OutColor;
-}
-#endif
-#endif

@@ -151,6 +151,15 @@ public:
 	virtual bool IterateDirectoryStat(const TCHAR* Directory, FDirectoryStatVisitor& Visitor) override;
 	virtual bool IterateDirectoryStatRecursively(const TCHAR* Directory, FDirectoryStatVisitor& Visitor) override;
 
+	// FileJournal API - must delegate to InnerFile for UE 5.7 incremental asset discovery
+	virtual bool FileJournalIsAvailable(const TCHAR* VolumeOrPath = nullptr, ELogVerbosity::Type* OutErrorLevel = nullptr, FString* OutError = nullptr) override;
+	virtual uint64 FileJournalGetMaximumSize(const TCHAR* VolumeOrPath = nullptr, ELogVerbosity::Type* OutErrorLevel = nullptr, FString* OutError = nullptr) const override;
+	virtual EFileJournalResult FileJournalGetLatestEntry(const TCHAR* VolumeName, FFileJournalId& OutJournalId, FFileJournalEntryHandle& OutEntryHandle, FString* OutError = nullptr) override;
+	virtual bool FileJournalIterateDirectory(const TCHAR* Directory, FDirectoryJournalVisitorFunc Visitor, FString* OutError = nullptr) override;
+	virtual FFileJournalData FileJournalGetFileData(const TCHAR* FilenameOrDirectory, FString* OutError = nullptr) override;
+	virtual EFileJournalResult FileJournalReadModified(const TCHAR* VolumeName, const FFileJournalId& JournalIdOfStartingEntry, const FFileJournalEntryHandle& StartingJournalEntry, TMap<FFileJournalFileHandle, FString>& KnownDirectories, TSet<FString>& OutModifiedDirectories, FFileJournalEntryHandle& OutNextJournalEntry, FString* OutError = nullptr) override;
+	virtual FString FileJournalGetVolumeName(FStringView InPath) override;
+
 private:
 	/** Check if this file should be intercepted and served from memory */
 	bool ShouldInterceptFile(const TCHAR* Filename) const;
