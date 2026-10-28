@@ -74,6 +74,10 @@
 		{
 			"Name": "GilbertShaders",
 			"Enabled": false
+		},
+		{
+			"Name": "CommonUI",
+			"Enabled": true
 		}
 	]
 }
